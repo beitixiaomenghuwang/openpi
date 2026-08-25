@@ -22,6 +22,8 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.teleavatar_v1_policy as teleavatar_v1_policy
 import openpi.policies.teleavatar_v2_policy as teleavatar_v2_policy
+import openpi.policies.teleavatar_v1_policy_endeffector as teleavatar_v1_policy_endeffector
+import openpi.policies.teleavatar_v2_policy_endeffector as teleavatar_v2_policy_endeffector
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -437,6 +439,159 @@ class LeRobotTeleavatarV1DataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+@dataclasses.dataclass(frozen=True)
+class LeRobotTeleavatarV1EndEffectorDataConfig(DataConfigFactory):
+    """
+    Config for training on the Teleavatar v1 dual-arm robot dataset using the
+    end-effector representation.
+
+    Expects the extended 62-dim state/action layout
+    ([joint positions(16), velocities(16), efforts(16), left_ee_pose(7), right_ee_pose(7)]).
+    Camera pipeline is identical to LeRobotTeleavatarV1DataConfig: stereo head
+    camera with left-eye crop (optionally rotated 180° first), mono left/right
+    cameras. Gripper actions use the v1 asymmetric effort↔normalized mapping.
+    For the v2 robot use LeRobotTeleavatarV2EndEffectorDataConfig instead.
+
+    Model state format: [left_ee_pose(7), right_ee_pose(7)]
+    Model actions: [left_ee_pose(7), left_gripper(1), right_ee_pose(7), right_gripper(1)]
+    """
+    use_delta_ee_actions: bool = False
+    # Whether the head camera should be rotated 180° before the left-eye crop.
+    # Property of the source dataset orientation; forwarded to TeleavatarEndEffectorInputs.
+    rotate_head_camera: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack transform to match dataset keys to inference keys
+        repack_structure = {
+            "observation/images/left_color": "observation.images.left_color",
+            "observation/images/right_color": "observation.images.right_color",
+            "observation/images/head_camera": "observation.images.head_camera",
+            "observation/state": "observation.state",
+            "action": "action",
+        }
+        # When prompt_from_task is on, PromptFromLeRobotTask injects a top-level
+        # "prompt" string from meta.tasks[task_index]. RepackTransform rebuilds
+        # the dict from scratch, so the key has to be listed here or it's lost
+        # and TeleavatarEndEffectorInputs falls back to its hardcoded default
+        # for every sample. Only request the key when it will actually be
+        # present; otherwise the flat_item lookup would KeyError.
+        base_cfg = self.base_config or DataConfig()
+        if base_cfg.prompt_from_task:
+            repack_structure["prompt"] = "prompt"
+        repack_transform = _transforms.Group(
+            inputs=[_transforms.RepackTransform(repack_structure)]
+        )
+
+        # Data transforms for teleavatar end-effector policy
+        data_transforms = _transforms.Group(
+            inputs=[
+                teleavatar_v1_policy_endeffector.TeleavatarEndEffectorInputs(
+                    model_type=model_config.model_type,
+                    rotate_head_camera=self.rotate_head_camera,
+                )
+            ],
+            outputs=[teleavatar_v1_policy_endeffector.TeleavatarEndEffectorOutputs()],
+        )
+
+        # Apply delta actions if requested (for end-effector pose, not gripper efforts)
+        # Inputs are 16 dimensions: 7 left ee pose, 1 left gripper, 7 right ee pose, 1 right gripper
+        if self.use_delta_ee_actions:
+            # Apply delta to left ee pose (first 7 dims), leave left gripper (8th dim) absolute
+            # Apply delta to right ee pose (dims 9-15), leave right gripper (16th dim) absolute
+            delta_action_mask = _transforms.make_bool_mask(7, -1, 7, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # Model transforms
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotTeleavatarV2EndEffectorDataConfig(DataConfigFactory):
+    """
+    Config for training on the Teleavatar v2 dual-arm robot dataset using the
+    end-effector representation.
+
+    Expects the v2 62-dim state/action layout ([joint positions(16),
+    velocities(16), efforts(16), left_ee_pose(7), right_ee_pose(7)]; 72-dim
+    datasets append chassis dims — the indices used are identical) and 3
+    side-by-side stereo camera feeds, cropped one eye per camera exactly like
+    LeRobotTeleavatarV2DataConfig (head → left eye, left → right eye,
+    right → left eye). Gripper actions use the v2 trigger↔effort curve.
+
+    Model state format: [left_ee_pose(7), right_ee_pose(7)]
+    Model actions: [left_ee_pose(7), left_gripper(1), right_ee_pose(7), right_gripper(1)]
+    """
+    use_delta_ee_actions: bool = False
+    # Whether the head camera should be rotated 180° before the left-eye crop.
+    # Property of the source dataset orientation; forwarded to TeleavatarEndEffectorInputs.
+    rotate_head_camera: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack transform to match dataset keys to inference keys.
+        repack_structure = {
+            "observation/images/left_color": "observation.images.left_color",
+            "observation/images/right_color": "observation.images.right_color",
+            "observation/images/head_camera": "observation.images.head_camera",
+            "observation/state": "observation.state",
+            "action": "action",
+        }
+        # When prompt_from_task is on, PromptFromLeRobotTask injects a top-level
+        # "prompt" string from meta.tasks[task_index]. RepackTransform rebuilds
+        # the dict from scratch, so the key has to be listed here or it's lost
+        # and TeleavatarEndEffectorInputs falls back to its hardcoded default
+        # for every sample. Only request the key when it will actually be
+        # present; otherwise the flat_item lookup would KeyError.
+        base_cfg = self.base_config or DataConfig()
+        if base_cfg.prompt_from_task:
+            repack_structure["prompt"] = "prompt"
+        repack_transform = _transforms.Group(
+            inputs=[_transforms.RepackTransform(repack_structure)]
+        )
+
+        # Data transforms for teleavatar v2 end-effector policy
+        data_transforms = _transforms.Group(
+            inputs=[
+                teleavatar_v2_policy_endeffector.TeleavatarEndEffectorInputs(
+                    model_type=model_config.model_type,
+                    rotate_head_camera=self.rotate_head_camera,
+                )
+            ],
+            outputs=[teleavatar_v2_policy_endeffector.TeleavatarEndEffectorOutputs()],
+        )
+
+        # Apply delta actions if requested (for end-effector pose, not gripper efforts)
+        # Actions are 16 dimensions: 7 left ee pose, 1 left gripper, 7 right ee pose, 1 right gripper
+        if self.use_delta_ee_actions:
+            # Apply delta to left ee pose (first 7 dims), leave left gripper (8th dim) absolute
+            # Apply delta to right ee pose (dims 9-15), leave right gripper (16th dim) absolute
+            delta_action_mask = _transforms.make_bool_mask(7, -1, 7, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # Model transforms
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotTeleavatarV2DataConfig(DataConfigFactory):
@@ -999,9 +1154,76 @@ _CONFIGS = [
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
     ),
+    TrainConfig(
+        name="pi05_teleavatar_v1_endeffector",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            discrete_state_input=False,
+            action_dim=32  # Keep 32 to match pi0_base pretrained weights
+        ),
+        data=LeRobotTeleavatarV1EndEffectorDataConfig(
+            repo_id="inference",  # Dataset with progress labels
+            base_config=DataConfig(
+                prompt_from_task=True,  # Use task from dataset as prompt
+                action_sequence_keys=("action",)  # Use 'action' not 'actions'
+            ),
+            use_delta_ee_actions=False,
+            # Official robot head camera is mounted upside-down; the recorded
+            # frames are raw upside-down stereo in both training and inference.
+            rotate_head_camera=True,
+        ),
+        batch_size=64,
+        num_workers=32,
+        fsdp_devices=8,  # Enable FSDP: shard model across 8 GPUs to reduce memory per GPU
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=500_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/DATA/disk0/model/pi05_base/params"),
+        num_train_steps=20_000,
+    ),
     #
     # Fine-tuning Teleavatar v2 configs.
     #
+    TrainConfig(
+        name="pi05_teleavatar_v2_endeffector",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            discrete_state_input=False,
+            action_dim=32  # Keep 32 to match pi05_base pretrained weights; teleavatar uses the first 16 dims
+        ),
+        data=LeRobotTeleavatarV2EndEffectorDataConfig(
+            repo_id="path-to-dataset",  # Your local dataset name
+            base_config=DataConfig(
+                prompt_from_task=True,  # Read the language instruction from the LeRobot task field
+                action_sequence_keys=("action",)  # Use 'action' not 'actions'
+            ),
+            use_delta_ee_actions=False,
+            # v2 robot: head camera is right-side-up, so no 180° rotation
+            # before the left-eye crop. Set True only for datasets whose
+            # head camera was mounted upside-down.
+            rotate_head_camera=False,
+        ),
+        batch_size=64,
+        num_workers=32,
+        fsdp_devices=8,  # Enable FSDP: shard model across 8 GPUs to reduce memory per GPU
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=500_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/DATA/disk0/model/pi05_base/params"),
+        num_train_steps=20_000,
+    ),
     TrainConfig(
         name="pi05_teleavatar_v2",
         model=pi0_config.Pi0Config(
