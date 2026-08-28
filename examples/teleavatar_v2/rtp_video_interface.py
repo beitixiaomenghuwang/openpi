@@ -188,6 +188,11 @@ class RTPH265VideoInterface:
             images = {name: image.copy() for name, image in self.latest_images.items()}
             return images, dict(self.image_timestamps)
 
+    def get_image_timestamps(self) -> Dict[str, float]:
+        """Return receive timestamps without copying the decoded image buffers."""
+        with self.lock:
+            return dict(self.image_timestamps)
+
     def has_initial_frame(self) -> bool:
         return self._first_frame.is_set()
 

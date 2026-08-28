@@ -21,6 +21,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.teleavatar_v1_policy as teleavatar_v1_policy
+import openpi.policies.teleavatar_v2_ee_policy as teleavatar_v2_ee_policy
 import openpi.policies.teleavatar_v2_policy as teleavatar_v2_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -509,6 +510,57 @@ class LeRobotTeleavatarV2DataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotTeleavatarV2EEDataConfig(DataConfigFactory):
+    """Config for bimanual TeleAvatar V2 end-effector training.
+
+    The converter can keep its original 62D (or 72D) state/action records;
+    ``TeleavatarEEInputs`` exposes both arms as a 20D representation: each arm
+    contains position (3), row-wise rotation-6D (6), and gripper trigger (1).
+    Actions are relative SE(3) waypoints, while observation poses are absolute.
+    ``repo_id`` must point to the converted LeRobot dataset, not the raw MCAP
+    directory.
+    """
+
+    # Whether to rotate the raw head stereo image before taking its left eye.
+    rotate_head_camera: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_structure = {
+            "observation/images/left_color": "observation.images.left_color",
+            "observation/images/right_color": "observation.images.right_color",
+            "observation/images/head_camera": "observation.images.head_camera",
+            "observation/state": "observation.state",
+            "action": "action",
+        }
+        base_cfg = self.base_config or DataConfig()
+        if base_cfg.prompt_from_task:
+            repack_structure["prompt"] = "prompt"
+
+        repack_transform = _transforms.Group(
+            inputs=[_transforms.RepackTransform(repack_structure)]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[
+                teleavatar_v2_ee_policy.TeleavatarEEInputs(
+                    model_type=model_config.model_type,
+                    rotate_head_camera=self.rotate_head_camera,
+                )
+            ],
+            outputs=[teleavatar_v2_ee_policy.TeleavatarEEOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
@@ -962,8 +1014,6 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         batch_size=64,
         num_train_steps=20000,
-
-        
     ),
     TrainConfig(
         name="pi0_teleavatar_v1_low_mem_finetune",
@@ -1055,8 +1105,6 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         batch_size=64,
         num_train_steps=20000,
-
-        
     ),
     TrainConfig(
         name="pi0_teleavatar_v2_low_mem_finetune",
@@ -1091,6 +1139,99 @@ _CONFIGS = [
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
+    ),
+    #
+    # Fine-tuning bimanual TeleAvatar v2 end-effector configs.
+    # The model still uses action_dim=32 for checkpoint compatibility; the
+    # data transform fills the first 20 dimensions with both arms' [xyz, rot6d, gripper]
+    # and the remaining dimensions are padded with zeros.
+    #
+    TrainConfig(
+        name="pi05_teleavatar_v2_ee",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            discrete_state_input=True,
+            action_dim=32,
+        ),
+        data=LeRobotTeleavatarV2EEDataConfig(
+            repo_id="path-to-dataset",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            rotate_head_camera=False,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=500_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        policy_metadata={
+            "robot_type": "teleavatar_v2",
+            "action_space": "bimanual_end_effector",
+            "action_dim": teleavatar_v2_ee_policy.EE_ACTION_DIM,
+        },
+    ),
+    TrainConfig(
+        name="pi0_teleavatar_v2_ee",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=30,
+        ),
+        data=LeRobotTeleavatarV2EEDataConfig(
+            repo_id="path-to-dataset",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            rotate_head_camera=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        batch_size=64,
+        num_train_steps=20_000,
+        policy_metadata={
+            "robot_type": "teleavatar_v2",
+            "action_space": "bimanual_end_effector",
+            "action_dim": teleavatar_v2_ee_policy.EE_ACTION_DIM,
+        },
+    ),
+    TrainConfig(
+        name="pi0_teleavatar_v2_ee_low_mem_finetune",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_dim=32,
+            action_horizon=30,
+        ),
+        data=LeRobotTeleavatarV2EEDataConfig(
+            repo_id="path-to-dataset",
+            base_config=DataConfig(
+                prompt_from_task=False,
+                action_sequence_keys=("action",),
+            ),
+            rotate_head_camera=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        batch_size=16,
+        num_train_steps=20_000,
+        freeze_filter=pi0_config.Pi0Config(
+            action_dim=32,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        policy_metadata={
+            "robot_type": "teleavatar_v2",
+            "action_space": "bimanual_end_effector",
+            "action_dim": teleavatar_v2_ee_policy.EE_ACTION_DIM,
+        },
     ),
     TrainConfig(
         name="pi05_aloha_pen_uncap",
