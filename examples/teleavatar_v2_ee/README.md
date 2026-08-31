@@ -124,3 +124,28 @@ physical gripper states at startup.
 On input loss, invalid/non-finite model output, Ctrl+C, or normal exit, the
 client stops action playback. If real output was enabled, it publishes
 `/api/fsm/enable=0` before shutting down.
+
+## Inspect or Replay a Dataset Episode
+
+Use the EE replay tool to verify the converted parquet data before starting a
+policy. The explicit `--dry-run` mode reads one episode and prints both arm pose ranges,
+quaternions, gripper trigger ranges, and the largest per-frame translation
+step; it does not need ROS2 and publishes nothing:
+
+```bash
+python examples/teleavatar_v2_ee/replay_episode.py \
+  --dataset <dataset_path> --episode 0 --dry-run
+```
+
+For a measured-trajectory check, select `--source state`. The default
+`--source action` reads absolute EE targets from the recorded action column.
+After checking the dry-run output, an optional real replay ramps from the
+current left/right EE poses to frame 0 before publishing both API targets:
+
+```bash
+export ROS_DOMAIN_ID=29
+python examples/teleavatar_v2_ee/replay_episode.py \
+  --dataset <dataset_path> --episode 0 --source action --ramp-s 5
+```
+
+Do not run this alongside the policy client or another `/api/*` publisher.
