@@ -239,6 +239,10 @@ Deployment uses a **policy server + robot client** architecture: the policy serv
 - **TeleAvatar V1**: [examples/teleavatar_v1/README.md](examples/teleavatar_v1/README.md)
 - **TeleAvatar V2**: [examples/teleavatar_v2/README.md](examples/teleavatar_v2/README.md)
 
+By default the control loop blocks for a full inference round trip every
+`--open-loop-horizon` steps. To query the policy asynchronously instead and splice chunks
+smoothly, see [Real-Time Chunking](docs/real_time_chunking.md).
+
 > General caveat: at serve time, `--policy.config` must match the training config of the checkpoint — the two generations differ in image cropping and gripper conversion, and using the wrong generation fails silently.
 
 ## 📊 Data Format (Shared)
