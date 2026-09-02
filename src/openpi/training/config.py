@@ -1053,8 +1053,6 @@ _CONFIGS = [
                 prompt_from_task=True,  # Read the language instruction from the LeRobot task field
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
-            # RTC needs absolute targets: delta actions would need the prefix re-anchored
-            # to the new state first, which is not implemented.
             use_delta_joint_actions=False,
             rotate_head_camera=False,
         ),
@@ -1113,10 +1111,10 @@ _CONFIGS = [
                 prompt_from_task=True,  # Read the language instruction from the LeRobot task field
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
-            # Must stay False, unlike pi0_teleavatar_v2. RTC constrains the new chunk to
-            # agree with the previous one, but delta actions are anchored to the state they
-            # were predicted from, so the two chunks differ by exactly the motion in
-            # between. Re-anchoring the prefix is not implemented.
+            # Delta actions work too: the previous chunk is anchored to the state it was
+            # predicted from, and the server re-anchors it into the current frame before
+            # constraining against it (see TeleavatarInputs.delta_action_anchor). Absolute
+            # is the default here to match the other teleavatar configs.
             use_delta_joint_actions=False,
             # v2 robot: head camera is right-side-up, so no 180° rotation
             # before the left-eye crop. Set True only for v1 datasets, whose

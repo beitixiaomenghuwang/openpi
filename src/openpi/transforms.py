@@ -200,6 +200,22 @@ class SubsampleActions(DataTransformFn):
         return data
 
 
+@runtime_checkable
+class DeltaActionAnchor(Protocol):
+    """A transform that encodes actions relative to the current observation.
+
+    Real-Time Chunking constrains a new action chunk against the previous one, but the
+    previous chunk was encoded against an older observation, so the two are offset by
+    whatever the robot did in between. `Policy` uses this to move the previous chunk into
+    the current frame before constraining against it.
+    """
+
+    def delta_action_anchor(self, data: DataDict) -> np.ndarray | None:
+        """Per-action-dimension value this transform subtracts from the actions, in its own
+        input units (i.e. before normalization). Zero for dimensions that stay absolute,
+        None when the transform is a no-op."""
+
+
 @dataclasses.dataclass(frozen=True)
 class DeltaActions(DataTransformFn):
     """Repacks absolute actions into delta action space."""
@@ -220,6 +236,12 @@ class DeltaActions(DataTransformFn):
         data["actions"] = actions
 
         return data
+
+    def delta_action_anchor(self, data: DataDict) -> np.ndarray | None:
+        if self.mask is None:
+            return None
+        mask = np.asarray(self.mask)
+        return np.where(mask, np.asarray(data["state"])[..., : mask.shape[-1]], 0.0)
 
 
 @dataclasses.dataclass(frozen=True)

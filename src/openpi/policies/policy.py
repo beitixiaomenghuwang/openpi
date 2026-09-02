@@ -64,6 +64,7 @@ class Policy(BasePolicy):
                 overlap the client reports. JAX models only.
         """
         self._model = model
+        self._input_transforms = list(transforms)
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
         self._sample_kwargs = sample_kwargs or {}
@@ -73,9 +74,12 @@ class Policy(BasePolicy):
 
         self._rtc_config = rtc_config
         # Last chunk returned, in raw model space (guidance has to happen there), so the
-        # client never round-trips actions back.
+        # client never round-trips actions back, plus the delta-action anchor it was encoded
+        # against (None for policies whose actions are already absolute).
         self._rtc_prev_chunk: np.ndarray | None = None
+        self._rtc_prev_anchor: np.ndarray | None = None
         self._rtc_chunk_id = 0
+        self._rtc_normalize = next((t for t in self._input_transforms if isinstance(t, _transforms.Normalize)), None)
 
         if self._is_pytorch_model:
             if rtc_config is not None:
@@ -118,7 +122,25 @@ class Policy(BasePolicy):
             "execution_horizon": int(request.get(RTC_EXECUTION_HORIZON, self._model.action_horizon)),
         }
 
-    def _rtc_sample_kwargs(self, request: dict[str, int] | None) -> dict[str, Any]:
+    def _rtc_anchor(self, inputs: dict) -> np.ndarray | None:
+        """The delta-action anchor for this observation, in normalized action units.
+
+        Walks the input transforms so each sees the data in its own frame, and stops at the
+        first one that declares an anchor. Returns None when the actions are absolute, which
+        is when no re-anchoring is needed.
+        """
+        data = inputs
+        for transform in self._input_transforms:
+            if isinstance(transform, _transforms.DeltaActionAnchor):
+                anchor = transform.delta_action_anchor(data)
+                if anchor is not None:
+                    if self._rtc_normalize is not None:
+                        anchor = self._rtc_normalize({"actions": np.asarray(anchor)})["actions"]
+                    return np.asarray(anchor)
+            data = transform(data)
+        return None
+
+    def _rtc_sample_kwargs(self, request: dict[str, int] | None, anchor: np.ndarray | None) -> dict[str, Any]:
         """Build the RTC arguments to `sample_actions` from a client request."""
         if self._rtc_config is None:
             return {}
@@ -138,8 +160,15 @@ class Policy(BasePolicy):
         # The zero-padded tail carries weight 0, so it never contributes.
         prev = self._rtc_prev_chunk
         start = np.clip(request["prefix_start"], 0, len(prev))
+        valid = len(prev) - start
         aligned = np.zeros_like(prev)
-        aligned[: len(prev) - start] = prev[start:]
+        aligned[:valid] = prev[start:]
+        if self._rtc_prev_anchor is not None and anchor is not None:
+            # Delta actions are encoded against the observation they were predicted from, so
+            # the previous chunk sits in an older frame -- offset by whatever the robot did in
+            # between. Normalization is affine, so the difference of the two normalized
+            # anchors is exactly the offset in model space.
+            aligned[:valid] += _transforms.pad_to_dim(self._rtc_prev_anchor - anchor, prev.shape[-1])
         kwargs["prev_chunk"] = jnp.asarray(aligned)[np.newaxis, ...]
         kwargs["inference_delay"] = jnp.asarray(request["inference_delay"], dtype=jnp.int32)
         kwargs["execution_horizon"] = jnp.asarray(request["execution_horizon"], dtype=jnp.int32)
@@ -149,6 +178,7 @@ class Policy(BasePolicy):
     def reset(self) -> None:
         """Drop the RTC history so the next chunk is sampled unconstrained."""
         self._rtc_prev_chunk = None
+        self._rtc_prev_anchor = None
         self._rtc_chunk_id = 0
 
     @override
@@ -156,6 +186,7 @@ class Policy(BasePolicy):
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         rtc_request = self._take_rtc_request(inputs)
+        rtc_anchor = self._rtc_anchor(inputs) if self._rtc_config is not None else None
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -174,7 +205,7 @@ class Policy(BasePolicy):
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
-        sample_kwargs.update(self._rtc_sample_kwargs(rtc_request))
+        sample_kwargs.update(self._rtc_sample_kwargs(rtc_request, rtc_anchor))
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
@@ -185,6 +216,7 @@ class Policy(BasePolicy):
         if self._rtc_config is not None:
             # Stash in model space, before the output transforms.
             self._rtc_prev_chunk = np.asarray(actions[0, ...])
+            self._rtc_prev_anchor = rtc_anchor
             self._rtc_chunk_id += 1
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)

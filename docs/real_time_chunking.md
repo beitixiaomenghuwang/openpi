@@ -159,8 +159,25 @@ Then serve with `--rtc.mode=TRAINED`. A `TRAINED` config on a checkpoint with
 ## Limitations
 
 - **JAX only.** The PyTorch port in `openpi/models_pytorch` raises `NotImplementedError`.
-- **Absolute actions only.** Guidance assumes the previous chunk stays meaningful as the
-  robot moves, which holds for absolute joint targets. Delta actions
-  (`use_delta_joint_actions=True`, e.g. `pi0_teleavatar_v2`) are anchored to the state they
-  were predicted from and would need re-anchoring first; that is not implemented.
-- **One RTC client per server.**
+- **One RTC client per server.** The server holds the previous chunk, and a mismatched
+  chunk id raises rather than silently guiding against the wrong history.
+
+## Delta actions
+
+Actions encoded relative to the current observation (`use_delta_joint_actions=True`, or the
+generic `DeltaActions` transform) need one extra step: the previous chunk was encoded
+against an older observation, so the two chunks are offset by exactly whatever the robot
+did in between. Constraining against it unmoved would fight the motion.
+
+The server handles this. A transform declares what it subtracted by implementing
+`transforms.DeltaActionAnchor`:
+
+```python
+def delta_action_anchor(self, data: dict) -> np.ndarray | None: ...
+```
+
+`Policy` walks its input transforms so each sees the data in its own frame, normalizes the
+anchor, and shifts the cached chunk by the difference between the two anchors. Because
+normalization is affine, that difference is exactly the offset in model space. Implemented
+for `DeltaActions` and for the teleavatar v1/v2 input transforms; a policy with absolute
+actions returns `None` and the whole path is a no-op.
