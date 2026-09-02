@@ -43,7 +43,7 @@ class Args:
     """Port of the policy server"""
 
     # Control settings
-    control_frequency: float = 30.0
+    control_frequency: float = 45.0
     """Control loop frequency in Hz (rate at which the policy command is stepped)"""
 
     interp_frequency: float = 200.0
