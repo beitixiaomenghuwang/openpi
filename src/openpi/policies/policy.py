@@ -80,6 +80,7 @@ class Policy(BasePolicy):
         self._rtc_prev_anchor: np.ndarray | None = None
         self._rtc_chunk_id = 0
         self._rtc_normalize = next((t for t in self._input_transforms if isinstance(t, _transforms.Normalize)), None)
+        self._rtc_logged_anchor = False
 
         if self._is_pytorch_model:
             if rtc_config is not None:
@@ -134,6 +135,9 @@ class Policy(BasePolicy):
             if isinstance(transform, _transforms.DeltaActionAnchor):
                 anchor = transform.delta_action_anchor(data)
                 if anchor is not None:
+                    if not self._rtc_logged_anchor:
+                        self._rtc_logged_anchor = True
+                        logger.info("RTC: delta actions detected, re-anchoring against %s", type(transform).__name__)
                     if self._rtc_normalize is not None:
                         anchor = self._rtc_normalize({"actions": np.asarray(anchor)})["actions"]
                     return np.asarray(anchor)
@@ -260,3 +264,7 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
         np.save(output_path, np.asarray(data))
         return results
+
+    @override
+    def reset(self) -> None:
+        self._policy.reset()

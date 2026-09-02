@@ -57,11 +57,13 @@ adapt to it and you get the classic inpainting seam. Use it to compare, not in p
 ## Serving
 
 ```bash
-uv run scripts/serve_policy.py policy:checkpoint \
+uv run scripts/serve_policy.py --rtc.enabled policy:checkpoint \
     --policy.config=pi05_teleavatar_v2 \
-    --policy.dir=checkpoints/pi05_teleavatar_v2/my_experiment/20000 \
-    --rtc.enabled
+    --policy.dir=checkpoints/pi05_teleavatar_v2/my_experiment/20000
 ```
+
+The `--rtc.*` flags belong to the top-level parser, so they go **before**
+`policy:checkpoint` -- tyro applies everything after a subcommand to that subcommand.
 
 | flag | default | meaning |
 | --- | --- | --- |
