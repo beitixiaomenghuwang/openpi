@@ -20,6 +20,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from examples.teleavatar_v2_ee.ros2_interface import TeleavatarV2EEInterface  # noqa: E402
+from examples.teleavatar_v2_ee.ros2_interface import _rot6d_to_quaternion  # noqa: E402
 
 
 @dataclasses.dataclass
@@ -33,8 +34,14 @@ class Args:
     prompt: str = "perform the manipulation task"
     """Language instruction passed to the policy."""
 
+    policy_frequency: float = 45.0
+    """Sampling frequency represented by one returned policy action chunk."""
+
     control_frequency: float = 45.0
-    """Action playback rate. The default matches the converted dataset FPS."""
+    """Published command rate. Use 77 or 200 to evaluate interpolated output."""
+
+    interpolate: bool = True
+    """Linearly interpolate xyz/trigger and quaternion-nlerp orientation."""
 
     open_loop_horizon: int = 30
     """Actions executed from each model chunk (maximum 30 for the current config)."""
@@ -57,17 +64,26 @@ class Args:
     publish: bool = False
     """Actually publish /api commands. Without --publish, inference is read-only."""
 
-    wait_for_enter: bool = True
-    """Require Enter immediately before enabling real command publication."""
+    max_position_error: float = 0.20
+    """Stop if a target is farther from measured EE position than this (m); 0 disables."""
+
+    max_orientation_error: float = 0.80
+    """Stop if target/current EE orientation differs by more than this (rad); 0 disables."""
 
 
 def _validate_args(args: Args) -> None:
+    if args.policy_frequency <= 0.0:
+        raise ValueError("policy_frequency must be positive")
     if args.control_frequency <= 0.0:
         raise ValueError("control_frequency must be positive")
     if args.open_loop_horizon <= 0:
         raise ValueError("open_loop_horizon must be positive")
     if args.max_steps < 0:
         raise ValueError("max_steps cannot be negative")
+    if args.max_position_error < 0.0:
+        raise ValueError("max_position_error cannot be negative")
+    if args.max_orientation_error < 0.0:
+        raise ValueError("max_orientation_error cannot be negative")
     for name in ("initial_left_gripper_trigger", "initial_right_gripper_trigger"):
         if not 0.0 <= getattr(args, name) <= 1.0:
             raise ValueError(f"{name} must be in [0, 1]")
@@ -83,9 +99,8 @@ def _validate_server_metadata(metadata: dict) -> None:
         if actual is None:
             logging.warning("Policy metadata has no %r field; cannot verify %s", key, expected_value)
         elif actual != expected_value:
-            raise RuntimeError(
-                f"Policy/client mismatch: metadata[{key!r}]={actual!r}, expected {expected_value!r}"
-            )
+            raise RuntimeError(f"Policy/client mismatch: metadata[{key!r}]={actual!r}, expected {expected_value!r}")
+
 
 def _extract_action_chunk(result: dict, horizon: int) -> np.ndarray:
     if "actions" not in result:
@@ -100,39 +115,138 @@ def _extract_action_chunk(result: dict, horizon: int) -> np.ndarray:
     return actions[:horizon]
 
 
+def _nlerp_quaternion(first: np.ndarray, second: np.ndarray, alpha: float) -> np.ndarray:
+    """Interpolate two quaternions on their shortest path and renormalize."""
+    first_value = np.asarray(first, dtype=np.float64)
+    second_value = np.asarray(second, dtype=np.float64)
+    if float(np.dot(first_value, second_value)) < 0.0:
+        second_value = -second_value
+    value = (1.0 - alpha) * first_value + alpha * second_value
+    norm = float(np.linalg.norm(value))
+    if norm < 1e-7:
+        raise ValueError("Quaternion interpolation produced a degenerate value")
+    return (value / norm).astype(np.float32)
+
+
+def _resample_to_quaternion_action_chunk(
+    actions: np.ndarray,
+    *,
+    source_frequency: float,
+    target_frequency: float,
+    interpolate: bool,
+) -> np.ndarray:
+    """Convert and resample a rot6d policy chunk into quaternion commands.
+
+    Policy actions are absolute EE waypoints sampled at the dataset rate. A
+    higher command rate should add intermediate waypoints, not shorten the
+    open-loop horizon. Each arm changes from ``xyz + rot6d + trigger`` (10D)
+    to ``xyz + xyzw + trigger`` (8D). Rot6d is converted exactly once;
+    positions and triggers are linearly interpolated while quaternions use
+    shortest-path nlerp. With interpolation disabled, the same timestamps use
+    a zero-order hold for a useful baseline comparison.
+    """
+    values = np.asarray(actions, dtype=np.float32)
+    if values.ndim != 2 or values.shape[1] != 20:
+        raise ValueError(f"Expected action chunk with shape (N, 20), got {values.shape}")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Action chunk contains non-finite values")
+    if source_frequency <= 0.0 or target_frequency <= 0.0:
+        raise ValueError("source_frequency and target_frequency must be positive")
+
+    quaternion_actions = np.empty((len(values), 16), dtype=np.float32)
+    for source_start, target_start in ((0, 0), (10, 8)):
+        quaternion_actions[:, target_start : target_start + 3] = values[:, source_start : source_start + 3]
+        source_quaternions = np.stack(
+            [_rot6d_to_quaternion(rotation) for rotation in values[:, source_start + 3 : source_start + 9]]
+        )
+        for index in range(1, len(source_quaternions)):
+            if float(np.dot(source_quaternions[index - 1], source_quaternions[index])) < 0.0:
+                source_quaternions[index] *= -1.0
+        quaternion_actions[:, target_start + 3 : target_start + 7] = source_quaternions
+        quaternion_actions[:, target_start + 7] = values[:, source_start + 9]
+
+    if len(values) <= 1:
+        return quaternion_actions
+
+    duration = (len(values) - 1) / source_frequency
+    output_count = max(2, round(duration * target_frequency) + 1)
+    target_times = np.linspace(0.0, duration, output_count, dtype=np.float64)
+    source_times = np.arange(len(values), dtype=np.float64) / source_frequency
+    if not interpolate:
+        source_indices = np.minimum(np.floor(target_times * source_frequency + 1e-9).astype(np.int64), len(values) - 1)
+        return quaternion_actions[source_indices]
+
+    result = np.empty((output_count, 16), dtype=np.float32)
+    for dimension in (0, 1, 2, 7, 8, 9, 10, 15):
+        result[:, dimension] = np.interp(target_times, source_times, quaternion_actions[:, dimension])
+    lower = np.clip(np.searchsorted(source_times, target_times, side="right") - 1, 0, len(values) - 1)
+    upper = np.minimum(lower + 1, len(values) - 1)
+    denominator = source_times[upper] - source_times[lower]
+    alpha = np.divide(
+        target_times - source_times[lower],
+        denominator,
+        out=np.zeros_like(target_times),
+        where=denominator > 0.0,
+    )
+    for start in (3, 11):
+        source_quaternions = quaternion_actions[:, start : start + 4]
+        result[:, start : start + 4] = np.stack(
+            [
+                _nlerp_quaternion(source_quaternions[first], source_quaternions[second], float(weight))
+                for first, second, weight in zip(lower, upper, alpha, strict=True)
+            ]
+        )
+    return result
+
+
 def _run(args: Args, interface: TeleavatarV2EEInterface) -> None:
     client = websocket_client_policy.WebsocketClientPolicy(host=args.remote_host, port=args.remote_port)
     metadata = client.get_server_metadata()
     logging.info("Connected to policy server; metadata=%s", metadata)
     _validate_server_metadata(metadata)
 
-    if args.publish and args.wait_for_enter:
-        input(
-            f"Ready to control both arms at {args.control_frequency:.1f} Hz. "
-            "Press Enter to enable policy output, or Ctrl+C to abort: "
+    if args.publish:
+        logging.info(
+            "Policy output enabled automatically after sensor/server checks at %.1f Hz",
+            args.control_frequency,
         )
-    elif not args.publish:
+    else:
         logging.warning("Read-only mode: policy inference runs, but no /api commands are published")
 
     period = 1.0 / args.control_frequency
     total_steps = 0
+    previous_quaternions: np.ndarray | None = None
     while args.max_steps == 0 or total_steps < args.max_steps:
         observation = interface.get_policy_observation(args.prompt)
         inference_started = time.monotonic()
         result = client.infer(observation)
         inference_ms = (time.monotonic() - inference_started) * 1000.0
-        actions = _extract_action_chunk(result, args.open_loop_horizon)
+        model_actions = _extract_action_chunk(result, args.open_loop_horizon)
+        actions = _resample_to_quaternion_action_chunk(
+            model_actions,
+            source_frequency=args.policy_frequency,
+            target_frequency=args.control_frequency,
+            interpolate=args.interpolate,
+        )
+        if previous_quaternions is not None:
+            for arm_index, start in enumerate((3, 11)):
+                if float(np.dot(previous_quaternions[arm_index], actions[0, start : start + 4])) < 0.0:
+                    actions[:, start : start + 4] *= -1.0
         if args.max_steps:
             actions = actions[: args.max_steps - total_steps]
+        if len(actions) == 0:
+            break
 
         logging.info(
-            "Received %d bimanual EE actions in %.1f ms; first left xyz=(%.3f, %.3f, %.3f), left trigger=%.3f, right xyz=(%.3f, %.3f, %.3f), right trigger=%.3f",
+            "Received %d model actions -> %d commands in %.1f ms (%s); first left xyz=(%.3f, %.3f, %.3f), left trigger=%.3f, right xyz=(%.3f, %.3f, %.3f), right trigger=%.3f",
+            len(model_actions),
             len(actions),
             inference_ms,
+            "linear + quaternion nlerp" if args.interpolate else "zero-order hold",
             *actions[0, :3],
-            actions[0, 9],
-            *actions[0, 10:13],
-            actions[0, 19],
+            actions[0, 7],
+            *actions[0, 8:11],
+            actions[0, 15],
         )
 
         deadline = time.monotonic()
@@ -140,8 +254,19 @@ def _run(args: Args, interface: TeleavatarV2EEInterface) -> None:
             errors = interface.sensor_errors()
             if errors:
                 raise RuntimeError("Inputs became unavailable during action playback: " + "; ".join(errors))
+            target_errors = interface.ee_quaternion_target_errors(
+                action,
+                max_position_error=args.max_position_error,
+                max_orientation_error=args.max_orientation_error,
+            )
+            if target_errors:
+                message = "EE target safety limit exceeded: " + "; ".join(target_errors)
+                if args.publish:
+                    raise RuntimeError(message)
+                logging.warning("Read-only safety warning: %s", message)
             if args.publish:
-                interface.publish_action(action)
+                interface.publish_quaternion_action(action)
+            previous_quaternions = np.stack((action[3:7], action[11:15]))
             total_steps += 1
             deadline += period
             delay = deadline - time.monotonic()
@@ -154,12 +279,19 @@ def _run(args: Args, interface: TeleavatarV2EEInterface) -> None:
 def main(args: Args) -> int:
     _validate_args(args)
     logging.info(
-        "TeleAvatar V2 EE deployment: server=ws://%s:%d control=%.1fHz horizon=%d publish=%s",
+        "TeleAvatar V2 EE deployment: server=ws://%s:%d policy=%.1fHz control=%.1fHz horizon=%d interpolate=%s publish=%s",
         args.remote_host,
         args.remote_port,
+        args.policy_frequency,
         args.control_frequency,
         args.open_loop_horizon,
+        args.interpolate,
         args.publish,
+    )
+    logging.info(
+        "EE safety limits: position=%.3fm orientation=%.3frad (0 disables each check)",
+        args.max_position_error,
+        args.max_orientation_error,
     )
     logging.info(
         "Startup gripper triggers are left=%.3f right=%.3f (0=open, 1=closed); they must match the physical grippers",

@@ -44,6 +44,18 @@ def _pose_to_array(pose: Pose) -> np.ndarray:
     )
 
 
+def _quaternion_angle(first: np.ndarray, second: np.ndarray) -> float:
+    """Return the shortest angular distance between two xyzw quaternions."""
+    first = np.asarray(first, dtype=np.float64)
+    second = np.asarray(second, dtype=np.float64)
+    first_norm = float(np.linalg.norm(first))
+    second_norm = float(np.linalg.norm(second))
+    if first.shape != (4,) or second.shape != (4,) or first_norm < 1e-7 or second_norm < 1e-7:
+        raise ValueError("Quaternion comparison requires two non-zero 4D quaternions")
+    dot = float(np.dot(first / first_norm, second / second_norm))
+    return float(2.0 * np.arccos(np.clip(abs(dot), 0.0, 1.0)))
+
+
 def _rot6d_to_quaternion(rot6d: np.ndarray) -> np.ndarray:
     """Convert row-wise rotation-6D to a normalized ROS xyzw quaternion."""
     value = np.asarray(rot6d, dtype=np.float64)
@@ -150,12 +162,10 @@ class TeleavatarV2EEInterface(Node):
 
         self._pose_topics = {arm: f"/{arm}_arm/current_ee_pose" for arm in ("left", "right")}
         self._pose_publishers = {
-            arm: self.create_publisher(Pose, f"/api/{arm}_arm/target_pose", 10)
-            for arm in ("left", "right")
+            arm: self.create_publisher(Pose, f"/api/{arm}_arm/target_pose", 10) for arm in ("left", "right")
         }
         self._gripper_publishers = {
-            arm: self.create_publisher(Float32, f"/api/{arm}_gripper/cmd", 10)
-            for arm in ("left", "right")
+            arm: self.create_publisher(Float32, f"/api/{arm}_gripper/cmd", 10) for arm in ("left", "right")
         }
         self._enable_publisher = self.create_publisher(Float32, "/api/fsm/enable", 10)
         for arm in ("left", "right"):
@@ -213,6 +223,51 @@ class TeleavatarV2EEInterface(Node):
                 errors.append(f"pose:{topic} stale ({now - pose_timestamp:.2f}s)")
         return errors
 
+    def ee_quaternion_target_errors(
+        self,
+        action: np.ndarray,
+        *,
+        max_position_error: float = 0.20,
+        max_orientation_error: float = 0.80,
+    ) -> list[str]:
+        """Return safety violations between a 16D target and measured EE poses.
+
+        Each arm is ``xyz + quaternion xyzw + gripper trigger``. This check
+        deliberately compares against the latest measured current pose, so an
+        unexpected model jump is rejected before the target is published. A
+        threshold of zero disables that component.
+        """
+        value = np.asarray(action, dtype=np.float32)
+        if value.shape != (16,) or not np.all(np.isfinite(value)):
+            raise ValueError(f"Expected a finite 16D quaternion action, got shape {value.shape}")
+        if max_position_error < 0.0 or max_orientation_error < 0.0:
+            raise ValueError("EE safety thresholds cannot be negative")
+        if max_position_error == 0.0 and max_orientation_error == 0.0:
+            return []
+
+        with self._lock:
+            current_poses = dict(self._latest_poses)
+
+        errors: list[str] = []
+        for arm, start in (("left", 0), ("right", 8)):
+            current_pose = current_poses.get(arm)
+            if current_pose is None:
+                errors.append(f"{arm} current EE pose is unavailable")
+                continue
+            current = _pose_to_array(current_pose)
+            target_position = value[start : start + 3]
+            target_quaternion = value[start + 3 : start + 7]
+            position_error = float(np.linalg.norm(target_position - current[:3]))
+            orientation_error = _quaternion_angle(current[3:7], target_quaternion)
+            violations = []
+            if max_position_error > 0.0 and position_error > max_position_error:
+                violations.append(f"position {position_error:.3f}m > {max_position_error:.3f}m")
+            if max_orientation_error > 0.0 and orientation_error > max_orientation_error:
+                violations.append(f"orientation {orientation_error:.3f}rad > {max_orientation_error:.3f}rad")
+            if violations:
+                errors.append(f"{arm} target/current: " + ", ".join(violations))
+        return errors
+
     def wait_for_initial_data(self, timeout: float = 30.0) -> bool:
         deadline = time.monotonic() + timeout
         next_log = 0.0
@@ -256,21 +311,30 @@ class TeleavatarV2EEInterface(Node):
             "prompt": prompt,
         }
 
-    def publish_action(self, action: np.ndarray) -> None:
-        """Publish one absolute bimanual ``left(10D) + right(10D)`` action."""
+    def publish_quaternion_action(self, action: np.ndarray) -> None:
+        """Publish one absolute bimanual ``left(8D) + right(8D)`` action.
+
+        Each arm is ``xyz + quaternion xyzw + gripper trigger``. The caller
+        has already converted the policy's rot6d output and interpolated the
+        quaternion, so no rotation representation conversion happens here.
+        """
         value = np.asarray(action, dtype=np.float32)
-        if value.shape != (20,) or not np.all(np.isfinite(value)):
-            raise ValueError(f"Expected a finite 20D action, got shape {value.shape}")
+        if value.shape != (16,) or not np.all(np.isfinite(value)):
+            raise ValueError(f"Expected a finite 16D quaternion action, got shape {value.shape}")
 
         messages: dict[str, Pose] = {}
         triggers: dict[str, float] = {}
-        for arm, start in (("left", 0), ("right", 10)):
-            quaternion = _rot6d_to_quaternion(value[start + 3 : start + 9])
+        for arm, start in (("left", 0), ("right", 8)):
+            quaternion = value[start + 3 : start + 7]
+            quaternion_norm = float(np.linalg.norm(quaternion))
+            if quaternion_norm < 1e-7:
+                raise ValueError(f"{arm} target quaternion has near-zero norm")
+            quaternion = quaternion / quaternion_norm
             pose = Pose()
             pose.position.x, pose.position.y, pose.position.z = map(float, value[start : start + 3])
             pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = map(float, quaternion)
             messages[arm] = pose
-            triggers[arm] = float(np.clip(value[start + 9], 0.0, 1.0))
+            triggers[arm] = float(np.clip(value[start + 7], 0.0, 1.0))
 
         with self._lock:
             self._last_gripper_triggers.update(triggers)

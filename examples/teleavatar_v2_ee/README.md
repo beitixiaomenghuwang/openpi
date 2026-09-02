@@ -83,8 +83,8 @@ python examples/teleavatar_v2_ee/main.py \
   --max-steps 90
 ```
 
-For real control, add `--publish`. The client waits for Enter immediately
-before it starts publishing:
+For real control, add `--publish`. After the sensor and policy-server checks
+complete, inference and command publication start automatically:
 
 ```bash
 python examples/teleavatar_v2_ee/main.py \
@@ -93,10 +93,33 @@ python examples/teleavatar_v2_ee/main.py \
   --publish
 ```
 
-Defaults are 45 Hz and 30 actions per inference, matching the converter's
-current 45 FPS dataset and the EE model's action horizon. Use
-`--open-loop-horizon` to execute fewer actions before observing and inferring
-again.
+The policy chunk is sampled at 45 Hz by default. `main.py` converts each
+absolute rot6d waypoint to a quaternion once, linearly interpolates positions
+and gripper triggers, and shortest-path nlerps orientation directly in
+quaternion space. The resulting quaternion is published directly in the ROS
+`Pose` message. The chunk's original time span is preserved. For the two
+deployment experiments:
+
+```bash
+# 45 Hz policy output -> 77 Hz command stream
+python examples/teleavatar_v2_ee/main.py --remote-host <POLICY_SERVER_IP> \
+  --prompt "perform the manipulation task" --publish --control-frequency 77
+
+# 45 Hz policy output -> 200 Hz command stream
+python examples/teleavatar_v2_ee/main.py --remote-host <POLICY_SERVER_IP> \
+  --prompt "perform the manipulation task" --publish --control-frequency 200
+```
+
+Use `--no-interpolate` for a zero-order-hold baseline at the selected command
+rate, or `--policy-frequency` if the model chunk was generated at a rate other
+than 45 Hz. `--open-loop-horizon` controls how many model waypoints are used
+before observing and inferring again.
+
+Before every published command, the client compares each target EE pose with
+the latest measured current pose. It stops and disables output if the default
+position/orientation limits (0.20 m / 0.80 rad) are exceeded. Adjust them with
+`--max-position-error` and `--max-orientation-error`; use `0` to disable an
+individual check.
 
 ## Observation and Command Semantics
 
@@ -112,8 +135,9 @@ The client sends the raw keys consumed by `TeleavatarEEInputs`:
 The server converts both current poses to absolute position + row-wise
 rotation-6D, predicts relative SE(3) waypoints for both arms, and converts the
 result back to absolute pose9 before sending it to this client. The client
-therefore must not compose either pose a second time; it only converts each
-rotation-6D to a ROS quaternion.
+therefore must not compose either pose a second time. It converts each
+rotation-6D waypoint to a quaternion once, interpolates in quaternion space,
+and publishes that quaternion directly in the ROS `Pose` message.
 
 The gripper API convention is `0=open, 1=closed`. Since this robot API does not
 provide gripper position feedback, the observation tracks the last command
