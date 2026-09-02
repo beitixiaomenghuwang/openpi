@@ -93,30 +93,36 @@ python examples/teleavatar_v2_ee/main.py \
   --publish
 ```
 
-The policy chunk is sampled at 45 Hz by default. `main.py` converts each
-absolute rot6d waypoint to a quaternion once, linearly interpolates positions
-and gripper triggers, and shortest-path nlerps orientation directly in
-quaternion space. The resulting quaternion is published directly in the ROS
-`Pose` message. The chunk's original time span is preserved. For the two
-deployment experiments:
+The model waypoints are stepped at 45 Hz by default. `main.py` converts each
+absolute rot6d waypoint to a quaternion once and submits it to the ROS2
+interface as the latest target. A separate timer publishes at 200 Hz by
+default, linearly interpolating positions and gripper triggers and using
+shortest-path quaternion nlerp for orientation. Every ramp starts from the
+last command actually published, including when a new inference chunk begins;
+the first ramp starts from the measured EE poses. The first command publishes
+`/api/fsm/enable=1`, then the command callback repeats that heartbeat every
+four published frames (about 50 Hz at the default 200 Hz interpolation rate).
 
 ```bash
-# 45 Hz policy output -> 77 Hz command stream
+# 45 Hz model targets -> 77 Hz interpolated command stream
 python examples/teleavatar_v2_ee/main.py --remote-host <POLICY_SERVER_IP> \
-  --prompt "perform the manipulation task" --publish --control-frequency 77
+  --prompt "perform the manipulation task" --publish \
+  --control-frequency 45 --interp-frequency 77
 
-# 45 Hz policy output -> 200 Hz command stream
+# 45 Hz model targets -> 200 Hz interpolated command stream (the defaults)
 python examples/teleavatar_v2_ee/main.py --remote-host <POLICY_SERVER_IP> \
-  --prompt "perform the manipulation task" --publish --control-frequency 200
+  --prompt "perform the manipulation task" --publish \
+  --control-frequency 45 --interp-frequency 200
 ```
 
-Use `--no-interpolate` for a zero-order-hold baseline at the selected command
-rate, or `--policy-frequency` if the model chunk was generated at a rate other
-than 45 Hz. `--open-loop-horizon` controls how many model waypoints are used
-before observing and inferring again.
+Use `--no-interpolate` for a zero-order-hold baseline at the selected target
+rate. `--control-frequency` sets how quickly model waypoints are consumed;
+`--interp-frequency` only sets the timer publication rate.
+`--open-loop-horizon` controls how many model waypoints are used before
+observing and inferring again.
 
-Before every published command, the client compares each target EE pose with
-the latest measured current pose. It stops and disables output if the default
+Before accepting every model target, the client compares its EE pose with the
+latest measured current pose. It stops and disables output if the default
 position/orientation limits (0.20 m / 0.80 rad) are exceeded. Adjust them with
 `--max-position-error` and `--max-orientation-error`; use `0` to disable an
 individual check.
