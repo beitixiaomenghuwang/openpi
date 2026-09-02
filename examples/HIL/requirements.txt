@@ -1,2 +1,0 @@
-websockets>=12,<17
-eclipse-zenoh
