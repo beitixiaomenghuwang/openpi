@@ -124,6 +124,27 @@ def test_nothing_is_executed_until_the_warm_start_finishes():
     assert policy.calls == 5, "warm start must consume warmup_steps + calibration_steps inferences"
 
 
+def test_reset_reuses_the_calibration():
+    # Runtime calls agent.reset() at every episode boundary. Re-measuring there costs a
+    # multiple of the inference time during which the robot is not being commanded by the
+    # policy, and measures the same machine again; one blocking query for a fresh chunk is
+    # all a new episode needs.
+    policy = _FakePolicy(0.02)
+    broker = rtc.RTCActionBroker(
+        policy, rtc.RTCBrokerConfig(control_frequency=20.0, warmup_steps=2, calibration_steps=3)
+    )
+    broker.infer({"observation": 0})
+    assert policy.calls == 5
+    delay, horizon = broker.inference_delay, broker.execution_horizon
+
+    broker.reset()
+    broker.infer({"observation": 1})
+    assert policy.calls == 6, "a new episode should cost one query, not another warm start"
+    assert (broker.inference_delay, broker.execution_horizon) == (delay, horizon)
+    # The chunk is fresh, and nothing of the previous episode is carried over.
+    assert policy.requests[-1][rtc.RTC_PREV_CHUNK_ID] == 0
+
+
 def test_requires_an_rtc_enabled_server():
     class _PlainPolicy:
         def infer(self, obs):

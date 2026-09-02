@@ -82,19 +82,21 @@ class RTCActionBroker(_base_policy.BasePolicy):
         self._lock = threading.Lock()
         self._reset_state()
 
-    def _reset_state(self) -> None:
+    def _reset_state(self, *, keep_calibration: bool = False) -> None:
         self._chunk: Optional[Dict[str, Any]] = None
         self._cursor = 0
         self._step = 0
         self._chunk_id = 0
-        self._action_horizon = 0
         self._pending: Optional[concurrent.futures.Future] = None
         self._pending_step = 0
         self._last_request_step = 0
-        self._inference_delay = self._config.inference_delay or 0
-        self._execution_horizon = self._config.execution_horizon or 0
-        self._observed_delays: collections.deque = collections.deque(maxlen=self._config.adapt_window)
         self._calibrated = False
+        if not keep_calibration:
+            self._action_horizon = 0
+            self._inference_delay = self._config.inference_delay or 0
+            self._execution_horizon = self._config.execution_horizon or 0
+            self._observed_delays: collections.deque = collections.deque(maxlen=self._config.adapt_window)
+            self._measured = False
 
     @property
     def inference_delay(self) -> int:
@@ -133,7 +135,13 @@ class RTCActionBroker(_base_policy.BasePolicy):
         ever reaches `apply_action`: nothing is commanded while measuring.
         """
         cfg = self._config
-        total = cfg.warmup_steps + cfg.calibration_steps if cfg.calibration_steps else 1
+        if self._measured:
+            # A later episode: the delay is a property of this machine, not of the episode,
+            # and the server's graphs are already compiled. One blocking query is enough to
+            # get a chunk to execute.
+            total = 1
+        else:
+            total = cfg.warmup_steps + cfg.calibration_steps if cfg.calibration_steps else 1
         latencies = []
         result = None
         chunk_id = 0  # 0 on the first query only: nothing is executing yet
@@ -157,9 +165,16 @@ class RTCActionBroker(_base_policy.BasePolicy):
             elapsed = time.perf_counter() - started
             if cfg.calibration_steps and i >= cfg.warmup_steps:
                 latencies.append(elapsed)
-            logger.info(
-                "RTC warm start %d/%d: %.1f ms%s", i + 1, total, elapsed * 1000, "" if latencies else " (discarded)"
-            )
+            if self._measured:
+                logger.info("RTC re-arm: %.1f ms (reusing the measured delay)", elapsed * 1000)
+            else:
+                logger.info(
+                    "RTC warm start %d/%d: %.1f ms%s",
+                    i + 1,
+                    total,
+                    elapsed * 1000,
+                    "" if latencies else " (discarded)",
+                )
 
         assert result is not None
         self._action_horizon = int(result.get(RTC_ACTION_HORIZON, len(result["actions"])))
@@ -167,14 +182,16 @@ class RTCActionBroker(_base_policy.BasePolicy):
             self._inference_delay = self._delay_from_latencies(latencies)
         self._execution_horizon = self._resolve_execution_horizon()
         self._calibrated = True
-        logger.info(
-            "RTC calibrated: inference_delay=%d steps (%.0f ms @ %.1f Hz), execution_horizon=%d, chunk=%d",
-            self._inference_delay,
-            self._inference_delay / cfg.control_frequency * 1000,
-            cfg.control_frequency,
-            self._execution_horizon,
-            self._action_horizon,
-        )
+        if not self._measured:
+            self._measured = True
+            logger.info(
+                "RTC calibrated: inference_delay=%d steps (%.0f ms @ %.1f Hz), execution_horizon=%d, chunk=%d",
+                self._inference_delay,
+                self._inference_delay / cfg.control_frequency * 1000,
+                cfg.control_frequency,
+                self._execution_horizon,
+                self._action_horizon,
+            )
         # The last warm-start chunk is still aligned with step 0: same observation, and the
         # robot has not been commanded since.
         self._install(result, cursor=0)
@@ -292,4 +309,5 @@ class RTCActionBroker(_base_policy.BasePolicy):
                 self._pending.cancel()
                 concurrent.futures.wait([self._pending], timeout=self._config.max_wait_s)
             self._policy.reset()
-            self._reset_state()
+            # Keep the calibration: it measures this machine, not this episode.
+            self._reset_state(keep_calibration=True)
