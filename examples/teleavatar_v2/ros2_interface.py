@@ -120,6 +120,7 @@ class TeleavatarROS2Interface(Node):
         self._gripper_target = np.zeros(2)             # [left, right] effort (Nm)
         self._have_target = False
         self._enable_counter = 0
+        self._published_once = False   # so the log shows exactly when the arm is first commanded
         if self._interpolate:
             self._interp_timer = self.create_timer(self._interp_period, self._interp_publish)
             self.logger.info(
@@ -384,6 +385,9 @@ class TeleavatarROS2Interface(Node):
 
     def _publish_cmd(self, arm14: np.ndarray, grip2: np.ndarray):
         """Publish one des_q frame: both arms (clamped, velocity=0) + grippers + enable heartbeat."""
+        if not self._published_once:
+            self._published_once = True
+            self.logger.info("First des_q command published -- the arm is now being driven")
         timestamp = self.get_clock().now().to_msg()
 
         # enable heartbeat, ~50 Hz

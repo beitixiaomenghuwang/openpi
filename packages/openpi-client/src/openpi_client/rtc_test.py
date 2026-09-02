@@ -56,8 +56,10 @@ def _run(latency: float, control_hz: float, n_steps: int, **config_kwargs):
         index = int(result["actions"][0])
         chunk_id = result[rtc.RTC_CHUNK_ID]
         if chunk_id not in offsets:
+            # Warm-start chunks are all aligned with step 0 (same observation, prefix_start 0)
+            # and are absent from `offsets` because none of them was executed.
             previous = result["req_prev_id"]
-            offsets[chunk_id] = 0 if previous == 0 else offsets[previous] + result["req_prefix_start"]
+            offsets[chunk_id] = offsets.get(previous, 0) + result["req_prefix_start"]
         executed.append((step, chunk_id, offsets[chunk_id] + index))
         # Pace like Runtime._run_episode: never catch up a deficit, or the blocking warm
         # start on step 0 is followed by a burst of free steps.
@@ -99,6 +101,17 @@ def test_explicit_delay_and_horizon_skip_calibration():
     # Only the single bootstrap inference runs before the first action is executed.
     assert policy.requests[0][rtc.RTC_PREV_CHUNK_ID] == 0
     _assert_aligned(executed)
+
+
+def test_warm_start_exercises_the_constrained_path():
+    # The server traces a different graph once a previous chunk is attached, so the warm
+    # start has to trigger that compile and measure on it. Measuring the unconstrained path
+    # instead both under-estimates the delay and leaves the compile for the first real
+    # request, which then overruns the queue.
+    _, policy, _ = _run(0.05, 20.0, 25)
+    warm_start = policy.requests[:4]  # warmup_steps=1 + calibration_steps=3
+    assert warm_start[0][rtc.RTC_PREV_CHUNK_ID] == 0, "the first query has nothing to constrain against"
+    assert all(r[rtc.RTC_PREV_CHUNK_ID] != 0 for r in warm_start[1:])
 
 
 def test_nothing_is_executed_until_the_warm_start_finishes():

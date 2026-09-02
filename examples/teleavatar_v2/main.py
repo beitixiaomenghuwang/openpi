@@ -170,8 +170,8 @@ if __name__ == "__main__":
     # Setup logging
     logging.basicConfig(
         level=logging.INFO,
-        format='[%(asctime)s] %(levelname)s: %(message)s',
-        datefmt='%H:%M:%S',
+        format='[%(asctime)s.%(msecs)03d] %(levelname)s: %(message)s',
+        datefmt='%H:%M:%S',  # note: %(asctime)s below carries ms via the format string
         force=True
     )
 

@@ -39,7 +39,8 @@ class RTCBrokerConfig:
     # Rate at which the control loop calls `infer()`; converts latency into control steps.
     control_frequency: float
 
-    # Warm start. The first JAX call compiles, so warmup_steps should be >= 1.
+    # Warm start. Two JAX compilations happen here (unconstrained, then constrained), so
+    # warmup_steps should be >= 2 for the measurement to land on warm code.
     warmup_steps: int = 2
     calibration_steps: int = 5
     # 1.0 = worst case. Underestimating the delay leaves executed steps unconstrained.
@@ -135,15 +136,24 @@ class RTCActionBroker(_base_policy.BasePolicy):
         total = cfg.warmup_steps + cfg.calibration_steps if cfg.calibration_steps else 1
         latencies = []
         result = None
+        chunk_id = 0  # 0 on the first query only: nothing is executing yet
+        horizon = self._execution_horizon
         for i in range(total):
             started = time.perf_counter()
-            result = self._query(  # prev_chunk_id 0 => unconstrained; nothing is executing yet
+            # Every query after the first carries a previous chunk, so the server traces and
+            # compiles the *constrained* graph here rather than on the first real request --
+            # and the latencies measured below are the ones steady state will actually see.
+            result = self._query(
                 obs,
-                prev_chunk_id=0,
+                prev_chunk_id=chunk_id,
                 prefix_start=0,
                 delay=self._inference_delay,
-                horizon=self._execution_horizon,
+                horizon=horizon,
             )
+            chunk_id = int(result[RTC_CHUNK_ID])
+            # Constrain over the whole chunk until calibration produces a real horizon; the
+            # chunks all come from this same observation, so it costs nothing.
+            horizon = int(result.get(RTC_ACTION_HORIZON, len(result["actions"])))
             elapsed = time.perf_counter() - started
             if cfg.calibration_steps and i >= cfg.warmup_steps:
                 latencies.append(elapsed)
