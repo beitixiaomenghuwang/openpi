@@ -31,12 +31,21 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # RTC action conditioning: train with a clean action prefix of random length in
+    # [0, rtc_training_max_delay], driven at timestep 0 and excluded from the loss. Required
+    # for `RTCMode.TRAINED` inference; `RTCMode.GUIDED` is training-free and needs nothing.
+    rtc_training_max_delay: int = 0
 
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if not 0 <= self.rtc_training_max_delay < self.action_horizon:
+            raise ValueError(
+                f"rtc_training_max_delay must be in [0, action_horizon={self.action_horizon}) so that every "
+                f"sample keeps a supervised step, got {self.rtc_training_max_delay}."
+            )
 
     @property
     @override

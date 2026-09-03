@@ -1084,6 +1084,41 @@ _CONFIGS = [
         num_train_steps=20_000,
     ),
     TrainConfig(
+        # pi05_teleavatar_v2 plus RTC action conditioning, for `--rtc.mode=TRAINED` serving.
+        # Size rtc_training_max_delay to the worst end-to-end delay in control steps: the
+        # model forward alone is ~6 steps at 45 Hz (136 ms measured on a 4090), so 12 leaves
+        # room for network and transforms. Larger is not better, since only 1/(max_delay + 1)
+        # of samples then train the plain unconditional objective.
+        name="pi05_teleavatar_v2_rtc",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            discrete_state_input=True,
+            action_dim=32,  # Keep 32 to match the pretrained weights; teleavatar uses the first 16 dims
+            rtc_training_max_delay=12,
+        ),
+        data=LeRobotTeleavatarV2DataConfig(
+            repo_id="path-to-dataset",  # Your local dataset name
+            base_config=DataConfig(
+                prompt_from_task=True,  # Read the language instruction from the LeRobot task field
+                action_sequence_keys=("action",)  # Use 'action' not 'actions'
+            ),
+            use_delta_joint_actions=False,
+            rotate_head_camera=False,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=500_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
         name="pi0_teleavatar_v2",
         # Full fine-tune of pi0 on Teleavatar V2 data.
         model=pi0_config.Pi0Config(
@@ -1097,6 +1132,38 @@ _CONFIGS = [
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
             use_delta_joint_actions=False,  # Absolute joint positions (not deltas)
+            # v2 robot: head camera is right-side-up, so no 180° rotation
+            # before the left-eye crop. Set True only for v1 datasets, whose
+            # head camera was mounted upside-down.
+            rotate_head_camera=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        batch_size=64,
+        num_train_steps=20000,
+    ),
+    TrainConfig(
+        # pi0_teleavatar_v2 plus RTC action conditioning, for `--rtc.mode=TRAINED` serving.
+        # Size rtc_training_max_delay to the worst end-to-end delay in control steps: the
+        # model forward alone is ~5 steps at 45 Hz (119 ms measured on a 4090), so 10 leaves
+        # room for network and transforms. Larger is not better, since only 1/(max_delay + 1)
+        # of samples then train the plain unconditional objective.
+        name="pi0_teleavatar_v2_rtc",
+        model=pi0_config.Pi0Config(
+            action_dim=32,  # Keep 32 to match pi0_base pretrained weights
+            action_horizon=30,
+            rtc_training_max_delay=10,
+        ),
+        data=LeRobotTeleavatarV2DataConfig(
+            repo_id="path-to-dataset",  # Your local dataset name
+            base_config=DataConfig(
+                prompt_from_task=True,  # Read the language instruction from the LeRobot task field
+                action_sequence_keys=("action",)  # Use 'action' not 'actions'
+            ),
+            # Delta actions work too: the previous chunk is anchored to the state it was
+            # predicted from, and the server re-anchors it into the current frame before
+            # constraining against it (see TeleavatarInputs.delta_action_anchor). Absolute
+            # is the default here to match the other teleavatar configs.
+            use_delta_joint_actions=False,
             # v2 robot: head camera is right-side-up, so no 180° rotation
             # before the left-eye crop. Set True only for v1 datasets, whose
             # head camera was mounted upside-down.
@@ -1153,6 +1220,44 @@ _CONFIGS = [
             action_horizon=30,
             discrete_state_input=True,
             action_dim=32,
+        ),
+        data=LeRobotTeleavatarV2EEDataConfig(
+            repo_id="path-to-dataset",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            rotate_head_camera=False,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=500_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        policy_metadata={
+            "robot_type": "teleavatar_v2",
+            "action_space": "bimanual_end_effector",
+            "action_dim": teleavatar_v2_ee_policy.EE_ACTION_DIM,
+        },
+    ),
+    TrainConfig(
+        # EE RTC conditioning for `--rtc.mode=TRAINED`. With the current measured ~60 ms
+        # round-trip at 45 Hz, 8 steps provides jitter headroom while leaving most of the
+        # 30-step action horizon supervised. Reduce it if deployment latency is characterized
+        # more tightly; do not set it to the full action horizon.
+        name="pi05_teleavatar_v2_ee_rtc",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            discrete_state_input=True,
+            action_dim=32,
+            rtc_training_max_delay=8,
         ),
         data=LeRobotTeleavatarV2EEDataConfig(
             repo_id="path-to-dataset",

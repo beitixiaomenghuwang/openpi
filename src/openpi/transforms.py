@@ -1,7 +1,7 @@
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
 import re
-from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
+from typing import Any, Protocol, TypeAlias, TypeVar, runtime_checkable
 
 import flax.traverse_util as traverse_util
 import jax
@@ -200,6 +200,41 @@ class SubsampleActions(DataTransformFn):
         return data
 
 
+@runtime_checkable
+class DeltaActionAnchor(Protocol):
+    """A transform that encodes actions relative to the current observation.
+
+    Real-Time Chunking constrains a new action chunk against the previous one, but the
+    previous chunk was encoded against an older observation, so the two are offset by
+    whatever the robot did in between. `Policy` uses this to move the previous chunk into
+    the current frame before constraining against it.
+    """
+
+    def delta_action_anchor(self, data: DataDict) -> np.ndarray | None:
+        """Per-action-dimension value this transform subtracts from the actions, in its own
+        input units (i.e. before normalization). Zero for dimensions that stay absolute,
+        None when the transform is a no-op."""
+
+
+@runtime_checkable
+class RTCActionReanchor(Protocol):
+    """Transform-specific re-anchoring for non-additive action coordinates.
+
+    The ordinary ``DeltaActionAnchor`` path is sufficient when actions are obtained by
+    subtracting a vector from the observation. Pose actions on a Lie group need to move the
+    previous action chunk with the group operation instead, so they can provide this protocol.
+    Anchors and actions are in the transform's unnormalized input units.
+    """
+
+    def rtc_action_anchor(self, data: DataDict) -> Any | None:
+        """Return the frame used to encode this observation's actions, or ``None``."""
+
+    def rtc_reanchor(
+        self, actions: np.ndarray, previous_anchor: Any, current_anchor: Any
+    ) -> np.ndarray:
+        """Move an action chunk from ``previous_anchor`` into ``current_anchor``'s frame."""
+
+
 @dataclasses.dataclass(frozen=True)
 class DeltaActions(DataTransformFn):
     """Repacks absolute actions into delta action space."""
@@ -220,6 +255,12 @@ class DeltaActions(DataTransformFn):
         data["actions"] = actions
 
         return data
+
+    def delta_action_anchor(self, data: DataDict) -> np.ndarray | None:
+        if self.mask is None:
+            return None
+        mask = np.asarray(self.mask)
+        return np.where(mask, np.asarray(data["state"])[..., : mask.shape[-1]], 0.0)
 
 
 @dataclasses.dataclass(frozen=True)

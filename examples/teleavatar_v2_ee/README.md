@@ -8,6 +8,7 @@ The matching training configs are:
 
 - `pi0_teleavatar_v2_ee`
 - `pi05_teleavatar_v2_ee`
+- `pi05_teleavatar_v2_ee_rtc` (RTC `TRAINED` mode)
 - `pi0_teleavatar_v2_ee_low_mem_finetune`
 
 Each checkpoint returns a synchronized 20D action chunk:
@@ -67,6 +68,28 @@ uv run scripts/serve_policy.py policy:checkpoint \
 The checkpoint must contain its `assets/<dataset>/norm_stats.json` and must be
 trained with the bimanual EE config.
 
+For the first offline or simulation validation, enable RTC on the server and
+use the training-free `GUIDED` mode:
+
+```bash
+uv run scripts/serve_policy.py \
+  --rtc.enabled --rtc.mode=GUIDED \
+  policy:checkpoint \
+  --policy.config=pi05_teleavatar_v2_ee \
+  --policy.dir=checkpoints/pi05_teleavatar_v2_ee/<experiment>/<step>
+```
+
+After `pi05_teleavatar_v2_ee_rtc` has been trained and the measured delay is
+confirmed stable, switch only the server mode and checkpoint to `TRAINED`:
+
+```bash
+uv run scripts/serve_policy.py \
+  --rtc.enabled --rtc.mode=TRAINED \
+  policy:checkpoint \
+  --policy.config=pi05_teleavatar_v2_ee_rtc \
+  --policy.dir=checkpoints/pi05_teleavatar_v2_ee_rtc/<experiment>/<step>
+```
+
 ## Run the Client
 
 First run read-only. This receives live observations, calls the policy, checks
@@ -82,6 +105,20 @@ python examples/teleavatar_v2_ee/main.py \
   --prompt "perform the manipulation task" \
   --max-steps 90
 ```
+
+Add `--rtc` when connecting to an RTC-enabled server. The broker calibrates
+the round-trip delay at startup, then requests one new chunk asynchronously
+while this loop consumes exactly one action per control tick:
+
+```bash
+python examples/teleavatar_v2_ee/main.py \
+  --remote-host <POLICY_SERVER_IP> \
+  --prompt "perform the manipulation task" \
+  --rtc --max-steps 90
+```
+
+Keep this command read-only until the GUIDED latency and continuity checks
+pass; add `--publish` only for robot control.
 
 For real control, add `--publish`. After the sensor and policy-server checks
 complete, inference and command publication start automatically:
@@ -120,6 +157,9 @@ rate. `--control-frequency` sets how quickly model waypoints are consumed;
 `--interp-frequency` only sets the timer publication rate.
 `--open-loop-horizon` controls how many model waypoints are used before
 observing and inferring again.
+When `--rtc` is enabled, `--open-loop-horizon` is ignored because
+`RTCActionBroker` returns one action per control tick and handles chunk overlap
+on the server.
 
 Before accepting every model target, the client compares its EE pose with the
 latest measured current pose. It stops and disables output if the default

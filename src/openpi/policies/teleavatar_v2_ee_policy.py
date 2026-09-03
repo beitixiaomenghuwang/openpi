@@ -199,6 +199,47 @@ class TeleavatarEEInputs(transforms.DataTransformFn):
         inputs["prompt"] = data.get("prompt", "perform the manipulation task")
         return inputs
 
+    def rtc_action_anchor(self, data: dict) -> np.ndarray:
+        """Return the absolute EE frames used to encode the relative actions.
+
+        RTC needs this because the relative pose action is expressed in the observation
+        frame. Unlike joint deltas, changing that frame is an SE(3) composition rather than
+        an elementwise subtraction.
+        """
+        raw_state = _as_float_array(data["observation/state"], name="observation/state")
+        if raw_state.ndim != 1 or raw_state.shape[-1] < 62:
+            raise ValueError("TeleAvatar V2 EE RTC anchoring requires a 62D unbatched state")
+        return np.stack(
+            [
+                _pose7_to_matrix(raw_state[RAW_EE_OFFSET[arm] : RAW_EE_OFFSET[arm] + 7])
+                for arm in ("left", "right")
+            ],
+            axis=0,
+        ).astype(np.float32)
+
+    def rtc_reanchor(
+        self,
+        actions: np.ndarray,
+        previous_anchor: np.ndarray,
+        current_anchor: np.ndarray,
+    ) -> np.ndarray:
+        """Move relative EE waypoints from the previous observation frame to the current one."""
+        values = _as_float_array(actions, name="RTC previous actions").copy()
+        if values.ndim != 2 or values.shape[-1] < EE_ACTION_DIM:
+            raise ValueError(f"Expected RTC actions with shape (N, >= {EE_ACTION_DIM}), got {values.shape}")
+        previous = _as_float_array(previous_anchor, name="RTC previous anchor")
+        current = _as_float_array(current_anchor, name="RTC current anchor")
+        if previous.shape != (2, 4, 4) or current.shape != (2, 4, 4):
+            raise ValueError(
+                f"Expected two 4x4 RTC anchors, got previous={previous.shape}, current={current.shape}"
+            )
+
+        for arm_index, start in enumerate((0, EE_ARM_ACTION_DIM)):
+            frame_change = np.linalg.inv(current[arm_index]) @ previous[arm_index]
+            relative = _pose10_to_matrix(values[:, start : start + 9])
+            values[:, start : start + 9] = _matrix_to_pose10(frame_change @ relative)
+        return values
+
 
 @dataclasses.dataclass(frozen=True)
 class TeleavatarEEOutputs(transforms.DataTransformFn):

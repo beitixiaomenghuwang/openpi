@@ -11,6 +11,7 @@ import threading
 import time
 
 import numpy as np
+from openpi_client import rtc as _rtc
 from openpi_client import websocket_client_policy
 import rclpy
 import tyro
@@ -44,7 +45,25 @@ class Args:
     """Interpolate each new target from the last Pose actually published."""
 
     open_loop_horizon: int = 30
-    """Actions executed from each model chunk (maximum 30 for the current config)."""
+    """Actions executed from each model chunk when RTC is disabled."""
+
+    rtc: bool = False
+    """Use Real-Time Chunking: infer in a background thread and return one action per tick."""
+
+    rtc_warmup_steps: int = 2
+    """RTC warm start inferences discarded before latency calibration."""
+
+    rtc_calibration_steps: int = 5
+    """RTC inferences timed at startup to estimate the end-to-end delay."""
+
+    rtc_inference_delay: int | None = None
+    """Override the measured RTC inference delay in control steps."""
+
+    rtc_execution_horizon: int | None = None
+    """Override the RTC execution horizon in control steps; default is twice the delay."""
+
+    rtc_max_wait_s: float = 5.0
+    """Maximum wait if the RTC action queue runs dry."""
 
     max_steps: int = 0
     """Stop after this many published/dry-run actions; 0 runs until Ctrl+C."""
@@ -78,6 +97,19 @@ def _validate_args(args: Args) -> None:
         raise ValueError("interp_frequency must be positive")
     if args.open_loop_horizon <= 0:
         raise ValueError("open_loop_horizon must be positive")
+    if args.rtc:
+        if args.rtc_warmup_steps < 0:
+            raise ValueError("rtc_warmup_steps cannot be negative")
+        if args.rtc_calibration_steps < 0:
+            raise ValueError("rtc_calibration_steps cannot be negative")
+        if args.rtc_calibration_steps == 0 and args.rtc_inference_delay is None:
+            raise ValueError("rtc_calibration_steps=0 requires rtc_inference_delay")
+        if args.rtc_inference_delay is not None and args.rtc_inference_delay < 0:
+            raise ValueError("rtc_inference_delay cannot be negative")
+        if args.rtc_execution_horizon is not None and args.rtc_execution_horizon <= 0:
+            raise ValueError("rtc_execution_horizon must be positive")
+        if args.rtc_max_wait_s <= 0.0:
+            raise ValueError("rtc_max_wait_s must be positive")
     if args.max_steps < 0:
         raise ValueError("max_steps cannot be negative")
     if args.max_position_error < 0.0:
@@ -137,6 +169,14 @@ def _to_quaternion_action_chunk(actions: np.ndarray) -> np.ndarray:
     return quaternion_actions
 
 
+def _to_quaternion_action(action: np.ndarray) -> np.ndarray:
+    """Convert one 20D relative EE action to the 16D quaternion publish format."""
+    values = np.asarray(action, dtype=np.float32)
+    if values.shape != (20,):
+        raise ValueError(f"Expected one action with shape (20,), got {values.shape}")
+    return _to_quaternion_action_chunk(values[None, ...])[0]
+
+
 def _run(args: Args, interface: TeleavatarV2EEInterface) -> None:
     client = websocket_client_policy.WebsocketClientPolicy(host=args.remote_host, port=args.remote_port)
     metadata = client.get_server_metadata()
@@ -150,6 +190,10 @@ def _run(args: Args, interface: TeleavatarV2EEInterface) -> None:
         )
     else:
         logging.warning("Read-only mode: policy inference runs, but no /api commands are published")
+
+    if args.rtc:
+        _run_rtc(args, interface, client)
+        return
 
     period = 1.0 / args.control_frequency
     total_steps = 0
@@ -166,7 +210,8 @@ def _run(args: Args, interface: TeleavatarV2EEInterface) -> None:
             break
 
         logging.info(
-            "Received %d bimanual EE targets in %.1f ms; first left xyz=(%.3f, %.3f, %.3f), left trigger=%.3f, right xyz=(%.3f, %.3f, %.3f), right trigger=%.3f",
+            "Received %d bimanual EE targets in %.1f ms; first left xyz=(%.3f, %.3f, %.3f), "
+            "left trigger=%.3f, right xyz=(%.3f, %.3f, %.3f), right trigger=%.3f",
             len(actions),
             inference_ms,
             *actions[0, :3],
@@ -206,15 +251,89 @@ def _run(args: Args, interface: TeleavatarV2EEInterface) -> None:
             next_target_at = time.monotonic() + period
 
 
+def _run_rtc(
+    args: Args,
+    interface: TeleavatarV2EEInterface,
+    client: websocket_client_policy.WebsocketClientPolicy,
+) -> None:
+    """Run the EE control loop one action at a time through the asynchronous RTC broker."""
+    broker = _rtc.RTCActionBroker(
+        policy=client,
+        config=_rtc.RTCBrokerConfig(
+            control_frequency=args.control_frequency,
+            warmup_steps=args.rtc_warmup_steps,
+            calibration_steps=args.rtc_calibration_steps,
+            inference_delay=args.rtc_inference_delay,
+            execution_horizon=args.rtc_execution_horizon,
+            max_wait_s=args.rtc_max_wait_s,
+        ),
+    )
+
+    period = 1.0 / args.control_frequency
+    total_steps = 0
+    next_target_at: float | None = None
+    logging.info(
+        "RTC EE control loop enabled: one action per %.1f Hz tick; "
+        "server must be started with --rtc.enabled (use GUIDED for validation, TRAINED after RTC fine-tuning)",
+        args.control_frequency,
+    )
+    try:
+        while args.max_steps == 0 or total_steps < args.max_steps:
+            if next_target_at is not None:
+                delay = next_target_at - time.monotonic()
+                if delay > 0.0:
+                    time.sleep(delay)
+
+            observation = interface.get_policy_observation(args.prompt)
+            inference_started = time.monotonic()
+            result = broker.infer(observation)
+            inference_ms = (time.monotonic() - inference_started) * 1000.0
+            raw_action = np.asarray(result.get("actions"), dtype=np.float32)
+            if raw_action.shape != (20,):
+                raise RuntimeError(f"RTC broker returned one action with shape (20,), got {raw_action.shape}")
+            action = _to_quaternion_action(raw_action)
+
+            errors = interface.sensor_errors()
+            if errors:
+                raise RuntimeError("Inputs became unavailable during RTC playback: " + "; ".join(errors))
+            target_errors = interface.ee_quaternion_target_errors(
+                action,
+                max_position_error=args.max_position_error,
+                max_orientation_error=args.max_orientation_error,
+            )
+            if target_errors:
+                message = "EE target safety limit exceeded: " + "; ".join(target_errors)
+                if args.publish:
+                    raise RuntimeError(message)
+                logging.warning("Read-only safety warning: %s", message)
+            if args.publish:
+                interface.publish_quaternion_action(action)
+            total_steps += 1
+
+            if total_steps == 1 or total_steps % max(int(args.control_frequency), 1) == 0:
+                logging.info(
+                    "RTC action %d: infer %.1f ms, left xyz=(%.3f, %.3f, %.3f), right xyz=(%.3f, %.3f, %.3f)",
+                    total_steps,
+                    inference_ms,
+                    *action[:3],
+                    *action[8:11],
+                )
+            next_target_at = time.monotonic() + period
+    finally:
+        broker.reset()
+
+
 def main(args: Args) -> int:
     _validate_args(args)
     logging.info(
-        "TeleAvatar V2 EE deployment: server=ws://%s:%d targets=%.1fHz interp_publish=%.1fHz horizon=%d interpolate=%s publish=%s",
+        "TeleAvatar V2 EE deployment: server=ws://%s:%d targets=%.1fHz interp_publish=%.1fHz "
+        "horizon=%d rtc=%s interpolate=%s publish=%s",
         args.remote_host,
         args.remote_port,
         args.control_frequency,
         args.interp_frequency,
         args.open_loop_horizon,
+        args.rtc,
         args.interpolate,
         args.publish,
     )

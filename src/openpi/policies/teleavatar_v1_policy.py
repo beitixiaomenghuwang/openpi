@@ -78,6 +78,14 @@ def _right_gripper_normalized_to_effort(data: np.ndarray) -> np.ndarray:
     return np.where(grip < 0, grip * 7.0, grip)
 
 
+def _state_14d(data: dict) -> np.ndarray:
+    """The 14 arm joint positions the model sees, from the raw observation vector."""
+    return np.concatenate([
+        data["observation/state"][0:7],    # Left arm positions (indices 0-6)
+        data["observation/state"][8:15],   # Right arm positions (indices 8-14)
+    ], axis=0)
+
+
 @dataclasses.dataclass(frozen=True)
 class TeleavatarInputs(transforms.DataTransformFn):
     """
@@ -126,10 +134,7 @@ class TeleavatarInputs(transforms.DataTransformFn):
 
         # Extract 14-dim state from 48-dim observation
         # Input layout: [positions(0-15), velocities(16-31), efforts(32-47)]
-        state_14d = np.concatenate([
-            data["observation/state"][0:7],    # Left arm positions (indices 0-6)
-            data["observation/state"][8:15],   # Right arm positions (indices 8-14)
-        ], axis=0)
+        state_14d = _state_14d(data)
 
         # Create inputs dict. Do not change the keys in the dict below.
         # Pi0 models support three image inputs: one third-person view and two wrist views.
@@ -197,6 +202,18 @@ class TeleavatarInputs(transforms.DataTransformFn):
             )
 
         return inputs
+
+
+    def delta_action_anchor(self, data: dict) -> np.ndarray | None:
+        """See `transforms.DeltaActionAnchor`. Mirrors the subtraction in __call__: arm
+        joints are anchored to the current state, grippers stay absolute."""
+        if not self.use_delta_joint_actions:
+            return None
+        state_14d = _state_14d(data)
+        anchor = np.zeros(16, dtype=np.float32)
+        anchor[0:7] = state_14d[0:7]
+        anchor[8:15] = state_14d[7:14]
+        return anchor
 
 
 @dataclasses.dataclass(frozen=True)
