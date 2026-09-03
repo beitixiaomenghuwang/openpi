@@ -350,7 +350,7 @@ def main(args: Args) -> int:
 
     rclpy.init()
     interface: TeleavatarV2EEInterface | None = None
-    executor = rclpy.executors.MultiThreadedExecutor(num_threads=2)
+    executor = rclpy.executors.MultiThreadedExecutor()
     spin_thread: threading.Thread | None = None
     try:
         interface = TeleavatarV2EEInterface(

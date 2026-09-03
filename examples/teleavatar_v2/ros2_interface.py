@@ -243,7 +243,8 @@ class TeleavatarROS2Interface(Node):
             dead.append("video: RTP pipeline stopped (EOS/error)")
 
         # Split views from the RTP stream (already copies; no shared buffers).
-        rtp_images, rtp_stamps = self._video.get_latest_images_with_timestamps()
+        policy_views = tuple(_POLICY_TO_RTP_VIEW.values())
+        rtp_images, rtp_stamps = self._video.get_latest_images_with_timestamps(policy_views)
         for view in _POLICY_TO_RTP_VIEW.values():
             stamp = rtp_stamps.get(view)
             if view not in rtp_images or stamp is None:
