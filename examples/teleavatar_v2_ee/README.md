@@ -133,10 +133,12 @@ python examples/teleavatar_v2_ee/main.py \
 The model waypoints are stepped at 45 Hz by default. `main.py` converts each
 absolute rot6d waypoint to a quaternion once and submits it to the ROS2
 interface as the latest target. A separate timer publishes at 200 Hz by
-default, linearly interpolating positions and gripper triggers and using
-shortest-path quaternion nlerp for orientation. Every ramp starts from the
-last command actually published, including when a new inference chunk begins;
-the first ramp starts from the measured EE poses. The first command publishes
+default. The timer owns a stateful SE(3) command trajectory: translation and
+rotation have independent speed, acceleration and jerk limits, while
+orientation follows the shortest rotation-vector log/exp path. This avoids
+restarting a zero-velocity ramp at every model tick and keeps the published
+commands continuous when the target stream moves. The first trajectory state
+starts from the measured EE poses. The first command publishes
 `/api/fsm/enable=1`, then the command callback repeats that heartbeat every
 four published frames (about 50 Hz at the default 200 Hz interpolation rate).
 
@@ -154,7 +156,19 @@ python examples/teleavatar_v2_ee/main.py --remote-host <POLICY_SERVER_IP> \
 
 Use `--no-interpolate` for a zero-order-hold baseline at the selected target
 rate. `--control-frequency` sets how quickly model waypoints are consumed;
-`--interp-frequency` only sets the timer publication rate.
+`--interp-frequency` sets the timer publication rate. The trajectory limits
+are command-side limits; a value of `0` disables an individual limit. For
+example, the following keeps the default limits explicit:
+
+```bash
+python examples/teleavatar_v2_ee/main.py --remote-host <POLICY_SERVER_IP> \
+  --prompt "perform the manipulation task" --publish \
+  --control-frequency 45 --interp-frequency 200 \
+  --max-translation-speed 0.25 --max-rotation-speed 1.2 \
+  --max-translation-acceleration 1.0 --max-rotation-acceleration 4.0 \
+  --max-translation-jerk 10.0 --max-rotation-jerk 40.0
+```
+
 `--open-loop-horizon` controls how many model waypoints are used before
 observing and inferring again.
 When `--rtc` is enabled, `--open-loop-horizon` is ignored because
@@ -182,8 +196,8 @@ The server converts both current poses to absolute position + row-wise
 rotation-6D, predicts relative SE(3) waypoints for both arms, and converts the
 result back to absolute pose9 before sending it to this client. The client
 therefore must not compose either pose a second time. It converts each
-rotation-6D waypoint to a quaternion once, interpolates in quaternion space,
-and publishes that quaternion directly in the ROS `Pose` message.
+rotation-6D waypoint to a quaternion once, then the command-side trajectory
+publishes that quaternion directly in the ROS `Pose` message.
 
 The gripper API convention is `0=open, 1=closed`. Since this robot API does not
 provide gripper position feedback, the observation tracks the last command
