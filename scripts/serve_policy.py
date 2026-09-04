@@ -5,6 +5,7 @@ import socket
 
 import tyro
 
+from openpi.models import rtc as _rtc
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
@@ -37,6 +38,36 @@ class Default:
 
 
 @dataclasses.dataclass
+class RTCArgs:
+    """Real-Time Chunking: lets the robot keep executing while the policy is queried.
+
+    Needs an RTC-aware client (`openpi_client.rtc.RTCActionBroker`); an ordinary client just
+    gets unconstrained chunks. See docs/real_time_chunking.md.
+    """
+
+    enabled: bool = False
+    # "guided": training-free, works with any checkpoint, ~1.5x inference cost.
+    # "trained": hard prefix pinning, free, needs Pi0Config(rtc_training_max_delay > 0).
+    mode: _rtc.RTCMode = _rtc.RTCMode.GUIDED
+    # Shape of the weight decay between inference_delay and execution_horizon.
+    prefix_attention_schedule: _rtc.PrefixAttentionSchedule = _rtc.PrefixAttentionSchedule.EXP
+    # Upper clip on the guidance weight ("guided" only).
+    max_guidance_weight: float = 10.0
+    # "trained" only: re-noise the prefix so an unretrained checkpoint stays in distribution.
+    trained_prefix_noise: bool = False
+
+    def create(self) -> _rtc.RTCConfig | None:
+        if not self.enabled:
+            return None
+        return _rtc.RTCConfig(
+            mode=self.mode,
+            prefix_attention_schedule=self.prefix_attention_schedule,
+            max_guidance_weight=self.max_guidance_weight,
+            trained_prefix_noise=self.trained_prefix_noise,
+        )
+
+
+@dataclasses.dataclass
 class Args:
     """Arguments for the serve_policy script."""
 
@@ -54,6 +85,9 @@ class Args:
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
+
+    # Real-Time Chunking settings.
+    rtc: RTCArgs = dataclasses.field(default_factory=RTCArgs)
 
 
 # Default checkpoints that should be used for each environment.
@@ -77,24 +111,33 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 }
 
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
+def create_default_policy(
+    env: EnvMode, *, default_prompt: str | None = None, rtc_config: _rtc.RTCConfig | None = None
+) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
         return _policy_config.create_trained_policy(
-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
+            _config.get_config(checkpoint.config),
+            checkpoint.dir,
+            default_prompt=default_prompt,
+            rtc_config=rtc_config,
         )
     raise ValueError(f"Unsupported environment mode: {env}")
 
 
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
+    rtc_config = args.rtc.create()
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                rtc_config=rtc_config,
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            return create_default_policy(args.env, default_prompt=args.default_prompt, rtc_config=rtc_config)
 
 
 def main(args: Args) -> None:

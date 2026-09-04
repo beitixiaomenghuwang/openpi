@@ -19,12 +19,14 @@ import dataclasses
 import logging
 
 from openpi_client import action_chunk_broker
+from openpi_client import rtc as _rtc
 from openpi_client import websocket_client_policy as _websocket_client_policy
 from openpi_client.runtime import runtime as _runtime
 from openpi_client.runtime.agents import policy_agent as _policy_agent
 import tyro
 import pathlib
 import sys
+
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[2]))
 from examples.teleavatar_v2 import env as _env
 
@@ -41,13 +43,37 @@ class Args:
     """Port of the policy server"""
 
     # Control settings
-    control_frequency: float = 20.0
-    """Control loop frequency in Hz"""
+    control_frequency: float = 45.0
+    """Control loop frequency in Hz (rate at which the policy command is stepped)"""
+
+    interp_frequency: float = 200.0
+    """Rate (Hz) to republish des_q, interpolated from the command stream (~200 Hz)."""
+
+    interpolate: bool = True
+    """Interpolate des_q up to interp_frequency; --no-interpolate publishes raw (ZOH)."""
 
     open_loop_horizon: int = 16
     """Number of actions to execute before querying the policy again. Must not
     exceed the action chunk length of the trained model (30 for the teleavatar
-    configs)."""
+    configs). Ignored when --rtc is set."""
+
+    # Real-Time Chunking
+    rtc: bool = False
+    """Query the policy asynchronously and splice chunks instead of stalling the control
+    loop. Requires a server started with --rtc.enabled. See docs/real_time_chunking.md."""
+
+    rtc_calibration_steps: int = 5
+    """Warm start: inferences to time before executing anything, to size the delay and
+    execution horizon. 0 uses --rtc-inference-delay instead."""
+
+    rtc_warmup_steps: int = 2
+    """Inferences discarded before timing starts (the first JAX call compiles)."""
+
+    rtc_inference_delay: int | None = None
+    """Override the measured delay, in control steps."""
+
+    rtc_execution_horizon: int | None = None
+    """Override the execution horizon, in control steps. Default: 2x the delay."""
 
     # Task settings
     prompt: str = "Stack the three blocks"
@@ -69,7 +95,14 @@ def main(args: Args) -> None:
     logging.info("=" * 60)
     logging.info(f"Policy server: ws://{args.remote_host}:{args.remote_port}")
     logging.info(f"Control frequency: {args.control_frequency} Hz")
-    logging.info(f"Open-loop horizon: {args.open_loop_horizon} steps")
+    if args.interpolate:
+        logging.info(f"des_q interp publish: {args.interp_frequency} Hz (ZOH-staircase fix)")
+    else:
+        logging.info("des_q interpolation: OFF (raw commands, original ZOH behavior)")
+    if args.rtc:
+        logging.info("Real-Time Chunking: ON (async inference)")
+    else:
+        logging.info(f"Open-loop horizon: {args.open_loop_horizon} steps")
     logging.info(f"Prompt: '{args.prompt}'")
     logging.info("=" * 60)
 
@@ -87,15 +120,29 @@ def main(args: Args) -> None:
     # Note: Images are kept at original resolution to match training data
     environment = _env.TeleavatarEnvironment(
         prompt=args.prompt,
+        control_frequency=args.control_frequency,
+        interp_frequency=args.interp_frequency,
+        interpolate=args.interpolate,
     )
 
     # Create policy agent with action chunking
-    agent = _policy_agent.PolicyAgent(
-        policy=action_chunk_broker.ActionChunkBroker(
+    if args.rtc:
+        broker = _rtc.RTCActionBroker(
+            policy=ws_client_policy,
+            config=_rtc.RTCBrokerConfig(
+                control_frequency=args.control_frequency,
+                warmup_steps=args.rtc_warmup_steps,
+                calibration_steps=args.rtc_calibration_steps,
+                inference_delay=args.rtc_inference_delay,
+                execution_horizon=args.rtc_execution_horizon,
+            ),
+        )
+    else:
+        broker = action_chunk_broker.ActionChunkBroker(
             policy=ws_client_policy,
             action_horizon=args.open_loop_horizon,  # Execute this many actions before querying
         )
-    )
+    agent = _policy_agent.PolicyAgent(policy=broker)
 
     # Create runtime
     runtime = _runtime.Runtime(
@@ -123,8 +170,8 @@ if __name__ == "__main__":
     # Setup logging
     logging.basicConfig(
         level=logging.INFO,
-        format='[%(asctime)s] %(levelname)s: %(message)s',
-        datefmt='%H:%M:%S',
+        format='[%(asctime)s.%(msecs)03d] %(levelname)s: %(message)s',
+        datefmt='%H:%M:%S',  # note: %(asctime)s below carries ms via the format string
         force=True
     )
 
