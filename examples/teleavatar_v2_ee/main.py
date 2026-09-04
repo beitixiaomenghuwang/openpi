@@ -177,6 +177,33 @@ def _to_quaternion_action(action: np.ndarray) -> np.ndarray:
     return _to_quaternion_action_chunk(values[None, ...])[0]
 
 
+def _validate_and_publish_action(
+    args: Args,
+    interface: TeleavatarV2EEInterface,
+    action: np.ndarray,
+    *,
+    playback_context: str,
+) -> None:
+    """Recheck live inputs and enforce EE safety immediately before publishing."""
+    errors = interface.sensor_errors()
+    if errors:
+        raise RuntimeError(f"Inputs became unavailable during {playback_context}: " + "; ".join(errors))
+
+    target_errors = interface.ee_quaternion_target_errors(
+        action,
+        max_position_error=args.max_position_error,
+        max_orientation_error=args.max_orientation_error,
+    )
+    if target_errors:
+        message = "EE target safety limit exceeded: " + "; ".join(target_errors)
+        if args.publish:
+            raise RuntimeError(message)
+        logging.warning("Read-only safety warning: %s", message)
+
+    if args.publish:
+        interface.publish_quaternion_action(action)
+
+
 def _run(args: Args, interface: TeleavatarV2EEInterface) -> None:
     client = websocket_client_policy.WebsocketClientPolicy(host=args.remote_host, port=args.remote_port)
     metadata = client.get_server_metadata()
@@ -229,21 +256,12 @@ def _run(args: Args, interface: TeleavatarV2EEInterface) -> None:
                 # Match the mature runtime's pacing: a late step starts from
                 # the current time instead of replaying missed deadlines.
 
-            errors = interface.sensor_errors()
-            if errors:
-                raise RuntimeError("Inputs became unavailable during action playback: " + "; ".join(errors))
-            target_errors = interface.ee_quaternion_target_errors(
+            _validate_and_publish_action(
+                args,
+                interface,
                 action,
-                max_position_error=args.max_position_error,
-                max_orientation_error=args.max_orientation_error,
+                playback_context="action playback",
             )
-            if target_errors:
-                message = "EE target safety limit exceeded: " + "; ".join(target_errors)
-                if args.publish:
-                    raise RuntimeError(message)
-                logging.warning("Read-only safety warning: %s", message)
-            if args.publish:
-                interface.publish_quaternion_action(action)
             total_steps += 1
             # Anchor the next period to this completed submission. A delayed
             # step therefore slows the stream instead of releasing queued
@@ -293,21 +311,12 @@ def _run_rtc(
                 raise RuntimeError(f"RTC broker returned one action with shape (20,), got {raw_action.shape}")
             action = _to_quaternion_action(raw_action)
 
-            errors = interface.sensor_errors()
-            if errors:
-                raise RuntimeError("Inputs became unavailable during RTC playback: " + "; ".join(errors))
-            target_errors = interface.ee_quaternion_target_errors(
+            _validate_and_publish_action(
+                args,
+                interface,
                 action,
-                max_position_error=args.max_position_error,
-                max_orientation_error=args.max_orientation_error,
+                playback_context="RTC playback",
             )
-            if target_errors:
-                message = "EE target safety limit exceeded: " + "; ".join(target_errors)
-                if args.publish:
-                    raise RuntimeError(message)
-                logging.warning("Read-only safety warning: %s", message)
-            if args.publish:
-                interface.publish_quaternion_action(action)
             total_steps += 1
 
             if total_steps == 1 or total_steps % max(int(args.control_frequency), 1) == 0:

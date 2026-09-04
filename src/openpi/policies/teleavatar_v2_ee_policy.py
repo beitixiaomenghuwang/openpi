@@ -114,29 +114,6 @@ def _pose10_to_matrix(pose: np.ndarray) -> np.ndarray:
     return matrix
 
 
-def make_teleavatar_v2_ee_example() -> dict:
-    """Create a valid-shaped example for transform and policy smoke tests."""
-    identity_pose = np.array([0.35, 0.0, -0.3, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-    raw_state = np.zeros(62, dtype=np.float32)
-    raw_state[48:55] = identity_pose
-    raw_state[55:62] = identity_pose
-    raw_state[7] = 0.8
-    raw_state[15] = 0.8
-    raw_action = np.zeros((30, 62), dtype=np.float32)
-    raw_action[:, 48:55] = identity_pose
-    raw_action[:, 55:62] = identity_pose
-    raw_action[:, 39] = 2.0
-    raw_action[:, 47] = 2.0
-    return {
-        "observation/state": raw_state,
-        "observation/images/left_color": np.zeros((800, 2560, 3), dtype=np.uint8),
-        "observation/images/right_color": np.zeros((800, 2560, 3), dtype=np.uint8),
-        "observation/images/head_camera": np.zeros((1920, 3840, 3), dtype=np.uint8),
-        "action": raw_action,
-        "prompt": "perform the manipulation task",
-    }
-
-
 @dataclasses.dataclass(frozen=True)
 class TeleavatarEEInputs(transforms.DataTransformFn):
     """Map raw TeleAvatar V2 records to a bimanual 20D EE representation."""
