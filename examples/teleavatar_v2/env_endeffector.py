@@ -18,6 +18,8 @@ from examples.teleavatar_v2 import ros2_interface_endeffector
 class TeleavatarEndEffectorEnvironment(_environment.Environment):
     """Environment for the Teleavatar v2 dual-arm robot with end-effector representation."""
 
+    ros_interface_class = ros2_interface_endeffector.TeleavatarEndEffectorROS2Interface
+
     def __init__(
         self,
         prompt: str = "pick a toy and put it in the basket using left gripper",
@@ -57,7 +59,7 @@ class TeleavatarEndEffectorEnvironment(_environment.Environment):
 
         def ros_spin():
             rclpy.init()
-            self._ros_interface = ros2_interface_endeffector.TeleavatarEndEffectorROS2Interface()
+            self._ros_interface = self.ros_interface_class()
 
             # Spin in background
             executor = rclpy.executors.MultiThreadedExecutor()

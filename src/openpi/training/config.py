@@ -21,9 +21,10 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.teleavatar_v1_policy as teleavatar_v1_policy
-import openpi.policies.teleavatar_v2_policy as teleavatar_v2_policy
 import openpi.policies.teleavatar_v1_policy_endeffector as teleavatar_v1_policy_endeffector
+import openpi.policies.teleavatar_v2_policy as teleavatar_v2_policy
 import openpi.policies.teleavatar_v2_policy_endeffector as teleavatar_v2_policy_endeffector
+import openpi.policies.umi_policy as umi_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -665,6 +666,41 @@ class LeRobotTeleavatarV2DataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotUMIDataConfig(DataConfigFactory):
+    """Config for UMI dual-arm data with three already-cropped monocular cameras.
+
+    UMI stores absolute 16-D end-effector targets as two
+    ``xyz + quaternion_xyzw + gripper`` arms. The policy transform derives
+    relative ``xyz + rotation_6d + gripper`` actions and supplies no robot
+    state to pi0.5.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_structure = {
+            "observation/images/left_color": "observation.images.left_color",
+            "observation/images/right_color": "observation.images.right_color",
+            "observation/images/head_camera": "observation.images.head_camera",
+            "observation/state": "observation.state",
+            "action": "action",
+        }
+        base_cfg = self.base_config or DataConfig()
+        if base_cfg.prompt_from_task:
+            repack_structure["prompt"] = "prompt"
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)]),
+            data_transforms=_transforms.Group(
+                inputs=[umi_policy.UMIInputs()],
+                outputs=[umi_policy.UMIOutputs()],
+            ),
+            model_transforms=ModelTransformFactory()(model_config),
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
@@ -1213,6 +1249,36 @@ _CONFIGS = [
         batch_size=64,
         num_workers=32,
         fsdp_devices=8,  # Enable FSDP: shard model across 8 GPUs to reduce memory per GPU
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=500_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/DATA/disk0/model/pi05_base/params"),
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi05_umi_endeffector",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            discrete_state_input=False,
+            # Preserve the pi0.5 base checkpoint interface; UMI uses the first 20 dimensions.
+            action_dim=32,
+        ),
+        data=LeRobotUMIDataConfig(
+            repo_id="/home/caslx/Data/umi_mcap/umi_20260812_vio2_ee_combined",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+        ),
+        batch_size=64,
+        num_workers=32,
+        fsdp_devices=8,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=5_000,
             peak_lr=5e-5,
