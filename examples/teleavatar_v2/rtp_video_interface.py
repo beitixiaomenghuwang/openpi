@@ -14,7 +14,6 @@ import logging
 import threading
 import time
 from typing import Dict
-from typing import Iterable
 from typing import Optional
 
 import numpy as np
@@ -167,50 +166,27 @@ class RTPH265VideoInterface:
 
     def get_observation(self) -> Optional[dict]:
         """Return current image observation, or None before the first frame."""
-        images, _timestamps = self.get_latest_images_with_timestamps()
-        if self.camera_name not in images:
-            return None
-        return {"images": images}
+        with self.lock:
+            if self.camera_name not in self.latest_images:
+                return None
+            return {"images": {name: image.copy() for name, image in self.latest_images.items()}}
 
     def get_latest_image(self) -> Optional[np.ndarray]:
         """Return the latest composite RGB image."""
         with self.lock:
             image = self.latest_images.get(self.camera_name)
-        return None if image is None else image.copy()
+            return None if image is None else image.copy()
 
     def get_latest_images(self) -> Dict[str, np.ndarray]:
         """Return all latest images, including the composite and split crops."""
-        images, _timestamps = self.get_latest_images_with_timestamps()
-        return images
-
-    def get_latest_images_with_timestamps(
-        self, view_names: Optional[Iterable[str]] = None
-    ) -> tuple[Dict[str, np.ndarray], Dict[str, float]]:
-        """Return copies of selected latest views and their receive timestamps.
-
-        The lock only protects the short reference snapshot. Images are replaced,
-        rather than mutated, by ``_image_callback``, so copying after releasing the
-        lock cannot expose a partially-written frame and does not block the decoder
-        callback while large RGB buffers are copied.
-
-        When ``view_names`` is omitted, all currently available views are returned
-        for diagnostics and recording callers.
-        """
         with self.lock:
-            names = tuple(self.latest_images) if view_names is None else tuple(view_names)
-            image_refs = {name: self.latest_images.get(name) for name in names}
-            timestamps = {
-                name: self.image_timestamps[name]
-                for name in names
-                if name in self.image_timestamps
-            }
+            return {name: image.copy() for name, image in self.latest_images.items()}
 
-        images = {
-            name: image.copy()
-            for name, image in image_refs.items()
-            if image is not None
-        }
-        return images, timestamps
+    def get_latest_images_with_timestamps(self) -> tuple[Dict[str, np.ndarray], Dict[str, float]]:
+        """Return latest image copies and their receive timestamps."""
+        with self.lock:
+            images = {name: image.copy() for name, image in self.latest_images.items()}
+            return images, dict(self.image_timestamps)
 
     def get_image_timestamps(self) -> Dict[str, float]:
         """Return receive timestamps without copying the decoded image buffers."""

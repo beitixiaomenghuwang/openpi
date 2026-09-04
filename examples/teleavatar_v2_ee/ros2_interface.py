@@ -320,8 +320,7 @@ class TeleavatarV2EEInterface(Node):
         if errors:
             raise RuntimeError("Observation unavailable: " + "; ".join(errors))
 
-        policy_views = tuple(_POLICY_TO_RTP_VIEW.values())
-        images, _timestamps = self._video.get_latest_images_with_timestamps(policy_views)
+        images, _timestamps = self._video.get_latest_images_with_timestamps()
         with self._lock:
             poses = dict(self._latest_poses)
             gripper_triggers = dict(self._last_gripper_triggers)
