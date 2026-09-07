@@ -23,6 +23,7 @@ import openpi.policies.libero_policy as libero_policy
 import openpi.policies.teleavatar_v1_policy as teleavatar_v1_policy
 import openpi.policies.teleavatar_v2_ee_policy as teleavatar_v2_ee_policy
 import openpi.policies.teleavatar_v2_policy as teleavatar_v2_policy
+import openpi.policies.umi_policy as umi_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -551,6 +552,64 @@ class LeRobotTeleavatarV2EEDataConfig(DataConfigFactory):
             ],
             outputs=[teleavatar_v2_ee_policy.TeleavatarEEOutputs()],
         )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotUMIDataConfig(DataConfigFactory):
+    """Config for the bimanual UMI end-effector dataset.
+
+    The converted LeRobot dataset stores 16D absolute records for both
+    ``observation.state`` and ``action``: per arm ``[xyz(3), quat_xyzw(4), gripper(1)]``,
+    left arm first. ``UMIInputs`` turns each action waypoint into the 20D relative
+    representation the model is trained on: per arm ``[xyz(3), rotation-6D(6), gripper(1)]``,
+    anchored at the current end-effector pose of the same frame.
+
+    The images are already single-eye frames in the dataset (no stereo cropping needed).
+    Set ``use_head_camera=False`` for the recordings that only contain the two wrist
+    cameras; the base image slot is then padded and masked out.
+    """
+
+    # Whether the dataset provides ``observation.images.head_camera``.
+    use_head_camera: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_structure = {
+            "observation/images/left_color": "observation.images.left_color",
+            "observation/images/right_color": "observation.images.right_color",
+            "observation/state": "observation.state",
+            "action": "action",
+        }
+        if self.use_head_camera:
+            repack_structure["observation/images/head_camera"] = "observation.images.head_camera"
+        # RepackTransform rebuilds the dict from scratch, so the prompt injected by
+        # PromptFromLeRobotTask has to be listed explicitly - but only when it is
+        # actually present, otherwise the flat lookup raises a KeyError.
+        base_cfg = self.base_config or DataConfig()
+        if base_cfg.prompt_from_task:
+            repack_structure["prompt"] = "prompt"
+
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)])
+        data_transforms = _transforms.Group(
+            inputs=[
+                umi_policy.UMIInputs(
+                    model_type=model_config.model_type,
+                    use_head_camera=self.use_head_camera,
+                )
+            ],
+            outputs=[umi_policy.UMIOutputs()],
+        )
+        # The absolute -> relative conversion happens inside UMIInputs (it is an SE(3)
+        # composition, not the elementwise subtraction DeltaActions performs), so no
+        # additional delta transform is applied here.
         model_transforms = ModelTransformFactory()(model_config)
 
         return dataclasses.replace(
@@ -1336,6 +1395,129 @@ _CONFIGS = [
             "robot_type": "teleavatar_v2",
             "action_space": "bimanual_end_effector",
             "action_dim": teleavatar_v2_ee_policy.EE_ACTION_DIM,
+        },
+    ),
+    #
+    # Fine-tuning bimanual UMI end-effector configs.
+    #
+    # The dataset ships 16D absolute EE records; UMIInputs converts each action waypoint to
+    # the 20D relative form ([xyz, rot6d, gripper] per arm). The model keeps action_dim=32
+    # for checkpoint compatibility, so dims 20..31 are zero padding and UMIOutputs slices
+    # the first 20 back out.
+    #
+    # These are pi0.5 configs on purpose: UMI provides no proprioceptive state to the model
+    # (UMIInputs emits a 1D zero placeholder, and the relative actions already carry the
+    # current pose implicitly). pi0.5 has no continuous state input, so the placeholder costs
+    # nothing - but discrete_state_input must stay False, otherwise the prompt tokenizer would
+    # encode that placeholder as discrete state tokens. A pi0 config would feed the zeros
+    # through state_proj instead, which is why none is provided here.
+    #
+    TrainConfig(
+        name="pi05_umi",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            # Dataset is 30 fps, so one chunk covers 1 s of motion.
+            action_horizon=30,
+            discrete_state_input=False,
+            action_dim=32,
+        ),
+        data=LeRobotUMIDataConfig(
+            repo_id="path-to-dataset",  # e.g. /home/caslx/Data/umi_mcap/umi_20260812_vio2_ee_combined
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),  # The dataset key is 'action', not 'actions'
+            ),
+            use_head_camera=True,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=500_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        policy_metadata={
+            "robot_type": "umi",
+            "action_space": "bimanual_relative_end_effector",
+            "action_dim": umi_policy.UMI_ACTION_DIM,
+            "cameras": ["head_camera", "left_color", "right_color"],
+        },
+    ),
+    TrainConfig(
+        # Same as pi05_umi, for recordings that only contain the two wrist cameras
+        # (e.g. umi_20260803_vio2_ee_orb_prefixfix). The base image slot is zero-padded
+        # and masked out of the attention.
+        name="pi05_umi_wrist_only",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            discrete_state_input=False,
+            action_dim=32,
+        ),
+        data=LeRobotUMIDataConfig(
+            repo_id="path-to-dataset",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            use_head_camera=False,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=500_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        policy_metadata={
+            "robot_type": "umi",
+            "action_space": "bimanual_relative_end_effector",
+            "action_dim": umi_policy.UMI_ACTION_DIM,
+            "cameras": ["left_color", "right_color"],
+        },
+    ),
+    TrainConfig(
+        name="pi05_umi_low_mem_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            discrete_state_input=False,
+            action_dim=32,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotUMIDataConfig(
+            repo_id="path-to-dataset",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            use_head_camera=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=16,
+        num_train_steps=20_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        policy_metadata={
+            "robot_type": "umi",
+            "action_space": "bimanual_relative_end_effector",
+            "action_dim": umi_policy.UMI_ACTION_DIM,
+            "cameras": ["head_camera", "left_color", "right_color"],
         },
     ),
     TrainConfig(
