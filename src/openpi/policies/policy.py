@@ -15,10 +15,22 @@ from typing_extensions import override
 
 from openpi import transforms as _transforms
 from openpi.models import model as _model
+from openpi.models import rtc as _rtc
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 
+logger = logging.getLogger(__name__)
+
 BasePolicy: TypeAlias = _base_policy.BasePolicy
+
+# RTC fields the client adds to the observation dict; stripped before the input transforms.
+RTC_PREV_CHUNK_ID = "rtc/prev_chunk_id"
+RTC_PREFIX_START = "rtc/prefix_start"
+RTC_INFERENCE_DELAY = "rtc/inference_delay"
+RTC_EXECUTION_HORIZON = "rtc/execution_horizon"
+# Keys the server adds to the response.
+RTC_CHUNK_ID = "rtc/chunk_id"
+RTC_ACTION_HORIZON = "rtc/action_horizon"
 
 
 class Policy(BasePolicy):
@@ -33,6 +45,7 @@ class Policy(BasePolicy):
         metadata: dict[str, Any] | None = None,
         pytorch_device: str = "cpu",
         is_pytorch: bool = False,
+        rtc_config: _rtc.RTCConfig | None = None,
     ):
         """Initialize the Policy.
 
@@ -46,8 +59,12 @@ class Policy(BasePolicy):
             pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda:0").
                           Only relevant when is_pytorch=True.
             is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
+            rtc_config: Enables Real-Time Chunking: the policy keeps the raw (model-space)
+                chunk it last returned and constrains the next one to agree with it over the
+                overlap the client reports. JAX models only.
         """
         self._model = model
+        self._input_transforms = list(transforms)
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
         self._sample_kwargs = sample_kwargs or {}
@@ -55,19 +72,173 @@ class Policy(BasePolicy):
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
 
+        self._rtc_config = rtc_config
+        # Last chunk returned, in raw model space (guidance has to happen there), so the
+        # client never round-trips actions back, plus the delta-action anchor it was encoded
+        # against (None for policies whose actions are already absolute).
+        self._rtc_prev_chunk: np.ndarray | None = None
+        self._rtc_prev_anchor: Any | None = None
+        self._rtc_chunk_id = 0
+        self._rtc_normalize = next((t for t in self._input_transforms if isinstance(t, _transforms.Normalize)), None)
+        # The output transform normally receives both ``state`` and ``actions`` and can
+        # therefore use the full stats tree. RTC only rewrites cached actions; keep a
+        # one-key inverse here so checkpoints that also contain state stats remain valid.
+        self._rtc_unnormalize = None
+        if self._rtc_normalize is not None and self._rtc_normalize.norm_stats is not None:
+            self._rtc_unnormalize = _transforms.Unnormalize(
+                {"actions": self._rtc_normalize.norm_stats["actions"]},
+                use_quantiles=self._rtc_normalize.use_quantiles,
+            )
+        self._rtc_logged_anchor = False
+        self._rtc_reanchor_transform = next(
+            (t for t in self._input_transforms if isinstance(t, _transforms.RTCActionReanchor)), None
+        )
+
         if self._is_pytorch_model:
+            if rtc_config is not None:
+                raise NotImplementedError("RTC is only implemented for the JAX models (openpi.models.pi0).")
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
         else:
-            # JAX model setup
-            self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            # `rtc_config` selects the mode and schedule, so it changes the traced graph and
+            # has to be static; the per-request delay/horizon are passed as arrays.
+            self._sample_actions = nnx_utils.module_jit(model.sample_actions, static_argnames=("rtc_config",))
             self._rng = rng or jax.random.key(0)
+            if rtc_config is not None:
+                max_delay = getattr(model, "rtc_training_max_delay", 0)
+                if rtc_config.mode is _rtc.RTCMode.TRAINED and max_delay == 0 and not rtc_config.trained_prefix_noise:
+                    logger.warning(
+                        "RTC mode=TRAINED on a checkpoint with rtc_training_max_delay=0: the pinned prefix is "
+                        "off-distribution. Retrain with Pi0Config(rtc_training_max_delay=...), or set "
+                        "RTCConfig(trained_prefix_noise=True)."
+                    )
+                logger.info("RTC enabled: %s", rtc_config)
+
+    def _take_rtc_request(self, inputs: dict) -> dict[str, int] | None:
+        """Pop the RTC fields out of the raw observation dict, returning None when the client
+        is not driving RTC this step (first chunk after a reset, or an RTC-unaware client)."""
+        request = {k: inputs.pop(k) for k in list(inputs) if k.startswith("rtc/")}
+        if not request or self._rtc_config is None:
+            return None
+        prev_chunk_id = int(request.get(RTC_PREV_CHUNK_ID, 0))
+        if prev_chunk_id == 0:  # nothing executing yet: sample unconstrained
+            return None
+        if prev_chunk_id != self._rtc_chunk_id or self._rtc_prev_chunk is None:
+            raise RuntimeError(
+                f"RTC chunk id mismatch: client is executing chunk {prev_chunk_id} but the server last "
+                f"returned {self._rtc_chunk_id}. Only one RTC client per server is supported."
+            )
+        return {
+            "prefix_start": int(request.get(RTC_PREFIX_START, 0)),
+            "inference_delay": int(request.get(RTC_INFERENCE_DELAY, 0)),
+            "execution_horizon": int(request.get(RTC_EXECUTION_HORIZON, self._model.action_horizon)),
+        }
+
+    def _rtc_anchor(self, inputs: dict) -> Any | None:
+        """Return the action frame for this observation.
+
+        Walks the input transforms so each sees the data in its own frame, and stops at the
+        first one that declares an anchor. Transform-specific anchors use their own raw units;
+        generic delta anchors are converted to normalized action units. Returns None when the
+        actions are absolute, which is when no re-anchoring is needed.
+        """
+        data = inputs
+        for transform in self._input_transforms:
+            if isinstance(transform, _transforms.RTCActionReanchor):
+                anchor = transform.rtc_action_anchor(data)
+                if anchor is not None:
+                    if not self._rtc_logged_anchor:
+                        self._rtc_logged_anchor = True
+                        logger.info("RTC: transform-specific action re-anchoring via %s", type(transform).__name__)
+                    return anchor
+            if isinstance(transform, _transforms.DeltaActionAnchor):
+                anchor = transform.delta_action_anchor(data)
+                if anchor is not None:
+                    if not self._rtc_logged_anchor:
+                        self._rtc_logged_anchor = True
+                        logger.info("RTC: delta actions detected, re-anchoring against %s", type(transform).__name__)
+                    if self._rtc_normalize is not None:
+                        anchor = self._rtc_normalize({"actions": np.asarray(anchor)})["actions"]
+                    return np.asarray(anchor)
+            data = transform(data)
+        return None
+
+    def _rtc_normalize_actions(self, actions: np.ndarray) -> np.ndarray:
+        """Normalize the action dimensions covered by the action norm stats.
+
+        Model actions may be padded beyond the dataset action dimensions. Normalize only the
+        dimensions with statistics and preserve the padding exactly as returned by the model.
+        """
+        values = np.asarray(actions)
+        if self._rtc_normalize is None or self._rtc_normalize.norm_stats is None:
+            return values
+        stats = self._rtc_normalize.norm_stats["actions"]
+        norm_dim = np.asarray(stats.mean).shape[-1]
+        normalized = np.array(values, copy=True)
+        normalized[..., :norm_dim] = self._rtc_normalize({"actions": values[..., :norm_dim]})["actions"]
+        return normalized
+
+    def _rtc_unnormalize_actions(self, actions: np.ndarray) -> np.ndarray:
+        if self._rtc_unnormalize is None:
+            return np.asarray(actions)
+        return np.asarray(self._rtc_unnormalize({"actions": np.asarray(actions)})["actions"])
+
+    def _rtc_sample_kwargs(self, request: dict[str, int] | None, anchor: Any | None) -> dict[str, Any]:
+        """Build the RTC arguments to `sample_actions` from a client request."""
+        if self._rtc_config is None:
+            return {}
+        kwargs: dict[str, Any] = {"rtc_config": self._rtc_config}
+        if request is None:
+            return kwargs
+        if request["prefix_start"] >= len(self._rtc_prev_chunk):
+            # No overlap left; guiding towards zero padding would be worse than not guiding.
+            logger.warning(
+                "RTC: previous chunk fully consumed (prefix_start=%d >= %d); sampling unconstrained.",
+                request["prefix_start"],
+                len(self._rtc_prev_chunk),
+            )
+            return kwargs
+        # Left-align: the client has executed `prefix_start` steps of the previous chunk, so
+        # its step `prefix_start + k` and the new chunk's step `k` are the same control step.
+        # The zero-padded tail carries weight 0, so it never contributes.
+        prev = self._rtc_prev_chunk
+        start = np.clip(request["prefix_start"], 0, len(prev))
+        valid = len(prev) - start
+        aligned = np.zeros_like(prev)
+        aligned[:valid] = prev[start:]
+        if self._rtc_reanchor_transform is not None and self._rtc_prev_anchor is not None and anchor is not None:
+            previous_actions = self._rtc_unnormalize_actions(aligned[:valid])
+            reanchored = self._rtc_reanchor_transform.rtc_reanchor(
+                previous_actions,
+                self._rtc_prev_anchor,
+                anchor,
+            )
+            aligned[:valid] = self._rtc_normalize_actions(reanchored)
+        elif self._rtc_prev_anchor is not None and anchor is not None:
+            # Delta actions are encoded against the observation they were predicted from, so
+            # the previous chunk sits in an older frame -- offset by whatever the robot did in
+            # between. Normalization is affine, so the difference of the two normalized
+            # anchors is exactly the offset in model space.
+            aligned[:valid] += _transforms.pad_to_dim(self._rtc_prev_anchor - anchor, prev.shape[-1])
+        kwargs["prev_chunk"] = jnp.asarray(aligned)[np.newaxis, ...]
+        kwargs["inference_delay"] = jnp.asarray(request["inference_delay"], dtype=jnp.int32)
+        kwargs["execution_horizon"] = jnp.asarray(request["execution_horizon"], dtype=jnp.int32)
+        return kwargs
+
+    @override
+    def reset(self) -> None:
+        """Drop the RTC history so the next chunk is sampled unconstrained."""
+        self._rtc_prev_chunk = None
+        self._rtc_prev_anchor = None
+        self._rtc_chunk_id = 0
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        rtc_request = self._take_rtc_request(inputs)
+        rtc_anchor = self._rtc_anchor(inputs) if self._rtc_config is not None else None
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -86,14 +257,19 @@ class Policy(BasePolicy):
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+        sample_kwargs.update(self._rtc_sample_kwargs(rtc_request, rtc_anchor))
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
-        outputs = {
-            "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
-        }
+        actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        outputs = {"state": inputs["state"], "actions": actions}
         model_time = time.monotonic() - start_time
+
+        if self._rtc_config is not None:
+            # Stash in model space, before the output transforms.
+            self._rtc_prev_chunk = np.asarray(actions[0, ...])
+            self._rtc_prev_anchor = rtc_anchor
+            self._rtc_chunk_id += 1
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:
@@ -103,6 +279,9 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        if self._rtc_config is not None:
+            outputs[RTC_CHUNK_ID] = self._rtc_chunk_id
+            outputs[RTC_ACTION_HORIZON] = self._model.action_horizon
         return outputs
 
     @property
@@ -133,3 +312,7 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
         np.save(output_path, np.asarray(data))
         return results
+
+    @override
+    def reset(self) -> None:
+        self._policy.reset()

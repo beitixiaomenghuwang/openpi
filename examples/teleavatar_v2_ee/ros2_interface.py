@@ -19,6 +19,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from examples.teleavatar_v2.rtp_video_interface import RTPH265VideoInterface  # noqa: E402
+from examples.teleavatar_v2_ee.se3_trajectory import SE3Trajectory  # noqa: E402
 
 _EE_STATE_OFFSET = {"left": 48, "right": 55}
 _GRIPPER_STATE_INDEX = {"left": 7, "right": 15}
@@ -54,19 +55,6 @@ def _quaternion_angle(first: np.ndarray, second: np.ndarray) -> float:
         raise ValueError("Quaternion comparison requires two non-zero 4D quaternions")
     dot = float(np.dot(first / first_norm, second / second_norm))
     return float(2.0 * np.arccos(np.clip(abs(dot), 0.0, 1.0)))
-
-
-def _quaternion_nlerp(first: np.ndarray, second: np.ndarray, alpha: float) -> np.ndarray:
-    """Interpolate two xyzw quaternions on the shortest path."""
-    first = np.asarray(first, dtype=np.float64)
-    second = np.asarray(second, dtype=np.float64)
-    if float(np.dot(first, second)) < 0.0:
-        second = -second
-    value = (1.0 - alpha) * first + alpha * second
-    norm = float(np.linalg.norm(value))
-    if norm < 1e-7:
-        raise ValueError("Quaternion interpolation produced a degenerate value")
-    return value / norm
 
 
 def _rot6d_to_quaternion(rot6d: np.ndarray) -> np.ndarray:
@@ -136,6 +124,10 @@ class TeleavatarV2EEInterface(Node):
     The raw-state gripper entry therefore tracks the last command sent by this
     process and starts from the two configured initial trigger values. They
     must match the physical gripper states when deployment starts.
+
+    With interpolation enabled, Pose targets are handed to a stateful
+    command-side SE(3) trajectory and republished by a timer at
+    ``interp_frequency``. The hardware controller remains unchanged.
     """
 
     def __init__(
@@ -148,6 +140,13 @@ class TeleavatarV2EEInterface(Node):
         control_frequency: float = 45.0,
         interp_frequency: float = 200.0,
         interpolate: bool = True,
+        max_translation_speed: float = 0.25,
+        max_rotation_speed: float = 1.2,
+        max_translation_acceleration: float = 1.0,
+        max_rotation_acceleration: float = 4.0,
+        max_translation_jerk: float = 10.0,
+        max_rotation_jerk: float = 40.0,
+        max_trigger_speed: float = 5.0,
         initial_left_gripper_trigger: float = 0.0,
         initial_right_gripper_trigger: float = 0.0,
         node_name: str = "teleavatar_v2_ee_openpi_interface",
@@ -159,6 +158,18 @@ class TeleavatarV2EEInterface(Node):
             raise ValueError("control_frequency must be positive")
         if interp_frequency <= 0.0:
             raise ValueError("interp_frequency must be positive")
+        trajectory_limits = {
+            "max_translation_speed": max_translation_speed,
+            "max_rotation_speed": max_rotation_speed,
+            "max_translation_acceleration": max_translation_acceleration,
+            "max_rotation_acceleration": max_rotation_acceleration,
+            "max_translation_jerk": max_translation_jerk,
+            "max_rotation_jerk": max_rotation_jerk,
+            "max_trigger_speed": max_trigger_speed,
+        }
+        for name, value in trajectory_limits.items():
+            if float(value) < 0.0 or not np.isfinite(float(value)):
+                raise ValueError(f"{name} must be non-negative; use 0 to disable the limit")
         self.sensor_timeout = float(sensor_timeout)
         self._lock = Lock()
         self._latest_poses: dict[str, Pose] = {}
@@ -173,9 +184,17 @@ class TeleavatarV2EEInterface(Node):
         self._interpolate = bool(interpolate)
         self._ctrl_period = 1.0 / float(control_frequency)
         self._interp_period = 1.0 / float(interp_frequency)
-        self._ramp_from: np.ndarray | None = None
-        self._ramp_to: np.ndarray | None = None
-        self._ramp_t0: float | None = None
+        self._trajectory = SE3Trajectory(
+            minimum_duration=self._ctrl_period,
+            max_translation_speed=max_translation_speed,
+            max_rotation_speed=max_rotation_speed,
+            max_translation_acceleration=max_translation_acceleration,
+            max_rotation_acceleration=max_rotation_acceleration,
+            max_translation_jerk=max_translation_jerk,
+            max_rotation_jerk=max_rotation_jerk,
+            max_trigger_speed=max_trigger_speed,
+        )
+        self._trajectory_last_update: float | None = None
         self._last_cmd_action: np.ndarray | None = None
         self._have_target = False
         self._target_generation = 0
@@ -212,7 +231,17 @@ class TeleavatarV2EEInterface(Node):
         if self._interpolate:
             self.get_logger().info(
                 f"Pose interpolation ON: {control_frequency:.1f} Hz targets -> {interp_frequency:.1f} Hz publish "
-                f"(ramp {self._ctrl_period * 1000.0:.1f} ms, FSM heartbeat about {interp_frequency / 4.0:.1f} Hz)"
+                f"(stateful SE(3), FSM heartbeat about {interp_frequency / 4.0:.1f} Hz)"
+            )
+            self.get_logger().info(
+                "EE trajectory limits: translation %.3f m/s, %.3f m/s^2, %.3f m/s^3; "
+                "rotation %.3f rad/s, %.3f rad/s^2, %.3f rad/s^3",
+                max_translation_speed,
+                max_translation_acceleration,
+                max_translation_jerk,
+                max_rotation_speed,
+                max_rotation_acceleration,
+                max_rotation_jerk,
             )
         else:
             self.get_logger().info(
@@ -347,8 +376,8 @@ class TeleavatarV2EEInterface(Node):
         """Set one absolute bimanual ``left(8D) + right(8D)`` target.
 
         Each arm is ``xyz + quaternion xyzw + gripper trigger``. When
-        interpolation is enabled, a timer ramps from the last Pose actually
-        published to this target over one control period.
+        interpolation is enabled, a stateful command-side trajectory moves
+        toward this target at the interpolation timer rate.
         """
         value = np.asarray(action, dtype=np.float32)
         if value.shape != (16,) or not np.all(np.isfinite(value)):
@@ -377,18 +406,16 @@ class TeleavatarV2EEInterface(Node):
         # in the opposite order here could deadlock on the first command.
         measured_start = None
         with self._cmd_lock:
-            need_measured_start = self._last_cmd_action is None
+            need_measured_start = not self._trajectory.initialized
         if need_measured_start:
             measured_start = self._current_quaternion_action()
 
         now = time.monotonic()
         with self._cmd_lock:
-            if self._last_cmd_action is None:
-                self._last_cmd_action = measured_start if measured_start is not None else target.copy()
-            self._align_target_quaternions(target)
-            self._ramp_from = self._last_cmd_action.copy()
-            self._ramp_to = target
-            self._ramp_t0 = now
+            if not self._trajectory.initialized:
+                self._trajectory.reset(measured_start if measured_start is not None else target)
+                self._trajectory_last_update = now
+            self._trajectory.set_target(target)
             self._have_target = True
             self._target_generation += 1
 
@@ -418,16 +445,15 @@ class TeleavatarV2EEInterface(Node):
 
     def _interp_publish(self) -> None:
         with self._cmd_lock:
-            if not self._have_target or self._ramp_from is None or self._ramp_to is None or self._ramp_t0 is None:
+            if not self._have_target or not self._trajectory.initialized or self._trajectory_last_update is None:
                 return
-            alpha = float(np.clip((time.monotonic() - self._ramp_t0) / self._ctrl_period, 0.0, 1.0))
-            command = self._ramp_from + alpha * (self._ramp_to - self._ramp_from)
-            for start in (3, 11):
-                command[start : start + 4] = _quaternion_nlerp(
-                    self._ramp_from[start : start + 4],
-                    self._ramp_to[start : start + 4],
-                    alpha,
-                )
+            now = time.monotonic()
+            dt = max(now - self._trajectory_last_update, 1e-4)
+            # A delayed ROS callback must not turn one late timer event into a
+            # large Cartesian jump; later callbacks continue from this state.
+            dt = min(dt, max(4.0 * self._interp_period, self._ctrl_period))
+            self._trajectory_last_update = now
+            command = self._trajectory.step(dt)
             generation = self._target_generation
         self._publish_command(command, generation)
 
@@ -466,18 +492,10 @@ class TeleavatarV2EEInterface(Node):
                 self._pose_publishers[arm].publish(messages[arm])
                 self._gripper_publishers[arm].publish(Float32(data=triggers[arm]))
 
-            published_at = time.monotonic()
             with self._lock:
                 self._last_gripper_triggers.update(triggers)
             with self._cmd_lock:
                 self._last_cmd_action = command.copy()
-                if self._have_target and self._ramp_to is not None and generation != self._target_generation:
-                    # A target arrived while this command was in the DDS
-                    # publish calls. Rebase that ramp on the command which
-                    # actually reached the publisher.
-                    self._align_target_quaternions(self._ramp_to)
-                    self._ramp_from = command.copy()
-                    self._ramp_t0 = published_at
 
     def disable_output(self) -> None:
         published_disable = False
@@ -488,9 +506,8 @@ class TeleavatarV2EEInterface(Node):
                 was_enabled = self._output_enabled
                 self._output_enabled = False
                 self._enable_counter = 0
-                self._ramp_from = None
-                self._ramp_to = None
-                self._ramp_t0 = None
+                self._trajectory.reset()
+                self._trajectory_last_update = None
                 self._last_cmd_action = None
             if was_enabled and rclpy.ok():
                 self._enable_publisher.publish(Float32(data=0.0))

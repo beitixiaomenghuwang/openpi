@@ -78,6 +78,14 @@ def _right_gripper_normalized_to_effort(data: np.ndarray) -> np.ndarray:
     return np.where(grip < 0, grip * 7.0, grip)
 
 
+def _state_14d(data: dict) -> np.ndarray:
+    """The 14 arm joint positions the model sees, from the raw observation vector."""
+    return np.concatenate([
+        data["observation/state"][0:7],    # Left arm positions (indices 0-6)
+        data["observation/state"][8:15],   # Right arm positions (indices 8-14)
+    ], axis=0)
+
+
 @dataclasses.dataclass(frozen=True)
 class TeleavatarInputs(transforms.DataTransformFn):
     """
@@ -105,6 +113,10 @@ class TeleavatarInputs(transforms.DataTransformFn):
     #           officially released robot — its training data is upside-down too)
     #   False → frame already right-side-up before this transform
     rotate_head_camera: bool = False
+    # Arm joints only, gripper stays absolute. Done here rather than via the
+    # generic DeltaActions transform, since state (14-dim) and actions
+    # (16-dim, gripper-interleaved) don't share a layout it can index by position.
+    use_delta_joint_actions: bool = False
 
     def __call__(self, data: dict) -> dict:
         # Parse images to uint8 (H,W,C) format
@@ -122,10 +134,7 @@ class TeleavatarInputs(transforms.DataTransformFn):
 
         # Extract 14-dim state from 48-dim observation
         # Input layout: [positions(0-15), velocities(16-31), efforts(32-47)]
-        state_14d = np.concatenate([
-            data["observation/state"][0:7],    # Left arm positions (indices 0-6)
-            data["observation/state"][8:15],   # Right arm positions (indices 8-14)
-        ], axis=0)
+        state_14d = _state_14d(data)
 
         # Create inputs dict. Do not change the keys in the dict below.
         # Pi0 models support three image inputs: one third-person view and two wrist views.
@@ -168,6 +177,11 @@ class TeleavatarInputs(transforms.DataTransformFn):
             selected_actions[:, 7] = _left_gripper_effort_to_normalized(selected_actions[:, 7])
             selected_actions[:, 15] = _right_gripper_effort_to_normalized(selected_actions[:, 15])
 
+            # state_14d has no gripper slot, so right arm is at 7:14 here vs 8:15 in actions.
+            if self.use_delta_joint_actions:
+                selected_actions[:, 0:7] -= state_14d[np.newaxis, 0:7]
+                selected_actions[:, 8:15] -= state_14d[np.newaxis, 7:14]
+
             inputs["actions"] = selected_actions
 
         # Pass the prompt (aka language instruction) to the model. During
@@ -190,6 +204,18 @@ class TeleavatarInputs(transforms.DataTransformFn):
         return inputs
 
 
+    def delta_action_anchor(self, data: dict) -> np.ndarray | None:
+        """See `transforms.DeltaActionAnchor`. Mirrors the subtraction in __call__: arm
+        joints are anchored to the current state, grippers stay absolute."""
+        if not self.use_delta_joint_actions:
+            return None
+        state_14d = _state_14d(data)
+        anchor = np.zeros(16, dtype=np.float32)
+        anchor[0:7] = state_14d[0:7]
+        anchor[8:15] = state_14d[7:14]
+        return anchor
+
+
 @dataclasses.dataclass(frozen=True)
 class TeleavatarOutputs(transforms.DataTransformFn):
     """
@@ -203,6 +229,9 @@ class TeleavatarOutputs(transforms.DataTransformFn):
     For your own dataset, you can copy this class and modify the action dimension based on the comments below.
     """
 
+    # Must match the TeleavatarInputs setting for this config.
+    use_delta_joint_actions: bool = False
+
     def __call__(self, data: dict) -> dict:
         # Only return the first 16 actions for teleavatar.
         # Since the model may output more dimensions due to padding, we extract just what we need.
@@ -210,6 +239,12 @@ class TeleavatarOutputs(transforms.DataTransformFn):
         # Copy so the in-place gripper conversion below never mutates the
         # caller's array.
         actions = np.array(data["actions"][:, :16])
+
+        # data["state"] is the un-normalized 14-dim state: [left_arm(7), right_arm(7)].
+        if self.use_delta_joint_actions:
+            state = np.asarray(data["state"])
+            actions[:, 0:7] += state[0:7]
+            actions[:, 8:15] += state[7:14]
 
         # Convert normalized [0, 1] gripper values back to effort for robot
         # execution (inverse of the effort->normalized map in TeleavatarInputs).
