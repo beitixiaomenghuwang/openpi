@@ -76,6 +76,18 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
+    metadata = dict(train_config.policy_metadata or {})
+    # Keep camera metadata synchronized with the UMI data transform.  This is
+    # derived from the serving config, which must match the config used for
+    # training, so clients can select the required views automatically.
+    if isinstance(data_config, _config.LeRobotUMIDataConfig):
+        metadata["action_space"] = "bimanual_end_effector"
+        metadata["cameras"] = (
+            ["head_camera", "left_color", "right_color"]
+            if data_config.use_head_camera
+            else ["left_color", "right_color"]
+        )
+
     return _policy.Policy(
         model,
         transforms=[
@@ -92,7 +104,7 @@ def create_trained_policy(
             *repack_transforms.outputs,
         ],
         sample_kwargs=sample_kwargs,
-        metadata=train_config.policy_metadata,
+        metadata=metadata,
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
         rtc_config=rtc_config,

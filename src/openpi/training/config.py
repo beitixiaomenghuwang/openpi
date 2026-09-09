@@ -1422,12 +1422,12 @@ _CONFIGS = [
             action_dim=32,
         ),
         data=LeRobotUMIDataConfig(
-            repo_id="path-to-dataset",  # e.g. /home/caslx/Data/umi_mcap/umi_20260812_vio2_ee_combined
+            repo_id="umi_20260812_vio2_ee_combined",  # e.g. /home/caslx/Data/umi_mcap/umi_20260812_vio2_ee_combined
             base_config=DataConfig(
                 prompt_from_task=True,
                 action_sequence_keys=("action",),  # The dataset key is 'action', not 'actions'
             ),
-            use_head_camera=True,
+            use_head_camera=False,
         ),
         batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -1442,7 +1442,7 @@ _CONFIGS = [
         num_train_steps=20_000,
         policy_metadata={
             "robot_type": "umi",
-            "action_space": "bimanual_relative_end_effector",
+            "action_space": "bimanual_end_effector",
             "action_dim": umi_policy.UMI_ACTION_DIM,
             "cameras": ["head_camera", "left_color", "right_color"],
         },
@@ -1479,7 +1479,7 @@ _CONFIGS = [
         num_train_steps=20_000,
         policy_metadata={
             "robot_type": "umi",
-            "action_space": "bimanual_relative_end_effector",
+            "action_space": "bimanual_end_effector",
             "action_dim": umi_policy.UMI_ACTION_DIM,
             "cameras": ["left_color", "right_color"],
         },
@@ -1515,7 +1515,7 @@ _CONFIGS = [
         ema_decay=None,
         policy_metadata={
             "robot_type": "umi",
-            "action_space": "bimanual_relative_end_effector",
+            "action_space": "bimanual_end_effector",
             "action_dim": umi_policy.UMI_ACTION_DIM,
             "cameras": ["head_camera", "left_color", "right_color"],
         },

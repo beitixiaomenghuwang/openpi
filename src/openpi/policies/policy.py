@@ -263,6 +263,12 @@ class Policy(BasePolicy):
         start_time = time.monotonic()
         actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
         outputs = {"state": inputs["state"], "actions": actions}
+        # Robot-specific output transforms may need an unmodified observation value
+        # (for example, UMI composes relative EE actions with the current pose).
+        # Auxiliary fields are ignored by Observation.from_dict but preserved here.
+        for key in ("umi_state",):
+            if key in inputs:
+                outputs[key] = inputs[key]
         model_time = time.monotonic() - start_time
 
         if self._rtc_config is not None:

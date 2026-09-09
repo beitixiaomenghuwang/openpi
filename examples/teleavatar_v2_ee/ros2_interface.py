@@ -19,7 +19,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from examples.teleavatar_v2.rtp_video_interface import RTPH265VideoInterface  # noqa: E402
-from examples.teleavatar_v2_ee.se3_trajectory import SE3Trajectory  # noqa: E402
+from examples.teleavatar_v2_ee.se3_trajectory import SE3Interpolator  # noqa: E402
 
 _EE_STATE_OFFSET = {"left": 48, "right": 55}
 _GRIPPER_STATE_INDEX = {"left": 7, "right": 15}
@@ -125,9 +125,9 @@ class TeleavatarV2EEInterface(Node):
     process and starts from the two configured initial trigger values. They
     must match the physical gripper states when deployment starts.
 
-    With interpolation enabled, Pose targets are handed to a stateful
-    command-side SE(3) trajectory and republished by a timer at
-    ``interp_frequency``. The hardware controller remains unchanged.
+    With interpolation enabled, Pose targets are handed to a command-side SE(3)
+    interpolator and republished by a timer at ``interp_frequency``. The
+    hardware controller remains unchanged.
     """
 
     def __init__(
@@ -140,13 +140,6 @@ class TeleavatarV2EEInterface(Node):
         control_frequency: float = 45.0,
         interp_frequency: float = 200.0,
         interpolate: bool = True,
-        max_translation_speed: float = 0.25,
-        max_rotation_speed: float = 1.2,
-        max_translation_acceleration: float = 1.0,
-        max_rotation_acceleration: float = 4.0,
-        max_translation_jerk: float = 10.0,
-        max_rotation_jerk: float = 40.0,
-        max_trigger_speed: float = 5.0,
         initial_left_gripper_trigger: float = 0.0,
         initial_right_gripper_trigger: float = 0.0,
         node_name: str = "teleavatar_v2_ee_openpi_interface",
@@ -158,18 +151,6 @@ class TeleavatarV2EEInterface(Node):
             raise ValueError("control_frequency must be positive")
         if interp_frequency <= 0.0:
             raise ValueError("interp_frequency must be positive")
-        trajectory_limits = {
-            "max_translation_speed": max_translation_speed,
-            "max_rotation_speed": max_rotation_speed,
-            "max_translation_acceleration": max_translation_acceleration,
-            "max_rotation_acceleration": max_rotation_acceleration,
-            "max_translation_jerk": max_translation_jerk,
-            "max_rotation_jerk": max_rotation_jerk,
-            "max_trigger_speed": max_trigger_speed,
-        }
-        for name, value in trajectory_limits.items():
-            if float(value) < 0.0 or not np.isfinite(float(value)):
-                raise ValueError(f"{name} must be non-negative; use 0 to disable the limit")
         self.sensor_timeout = float(sensor_timeout)
         self._lock = Lock()
         self._latest_poses: dict[str, Pose] = {}
@@ -184,16 +165,7 @@ class TeleavatarV2EEInterface(Node):
         self._interpolate = bool(interpolate)
         self._ctrl_period = 1.0 / float(control_frequency)
         self._interp_period = 1.0 / float(interp_frequency)
-        self._trajectory = SE3Trajectory(
-            minimum_duration=self._ctrl_period,
-            max_translation_speed=max_translation_speed,
-            max_rotation_speed=max_rotation_speed,
-            max_translation_acceleration=max_translation_acceleration,
-            max_rotation_acceleration=max_rotation_acceleration,
-            max_translation_jerk=max_translation_jerk,
-            max_rotation_jerk=max_rotation_jerk,
-            max_trigger_speed=max_trigger_speed,
-        )
+        self._trajectory = SE3Interpolator(duration=self._ctrl_period)
         self._trajectory_last_update: float | None = None
         self._last_cmd_action: np.ndarray | None = None
         self._have_target = False
@@ -206,6 +178,12 @@ class TeleavatarV2EEInterface(Node):
             decoder=rtp_decoder,
         )
         self._video.start()
+        # The policy server metadata selects whether the head view is needed.
+        # Wrist views are always required by the bimanual EE policies.
+        self._required_camera_views = {
+            _POLICY_TO_RTP_VIEW["left_color"],
+            _POLICY_TO_RTP_VIEW["right_color"],
+        }
 
         self._pose_topics = {arm: f"/{arm}_arm/current_ee_pose" for arm in ("left", "right")}
         self._pose_publishers = {
@@ -231,17 +209,9 @@ class TeleavatarV2EEInterface(Node):
         if self._interpolate:
             self.get_logger().info(
                 f"Pose interpolation ON: {control_frequency:.1f} Hz targets -> {interp_frequency:.1f} Hz publish "
-                f"(stateful SE(3), FSM heartbeat about {interp_frequency / 4.0:.1f} Hz)"
-            )
-            self.get_logger().info(
-                "EE trajectory limits: translation %.3f m/s, %.3f m/s^2, %.3f m/s^3; "
-                "rotation %.3f rad/s, %.3f rad/s^2, %.3f rad/s^3",
-                max_translation_speed,
-                max_translation_acceleration,
-                max_translation_jerk,
-                max_rotation_speed,
-                max_rotation_acceleration,
-                max_rotation_jerk,
+                f"(lerp/slerp over one {self._ctrl_period * 1000.0:.1f} ms control period, "
+                f"FSM heartbeat about {interp_frequency / 4.0:.1f} Hz). No speed/acceleration/jerk limit is "
+                "applied to the published commands"
             )
         else:
             self.get_logger().info(
@@ -267,7 +237,7 @@ class TeleavatarV2EEInterface(Node):
             errors.append("RTP pipeline stopped")
 
         timestamps = self._video.get_image_timestamps()
-        for view in _POLICY_TO_RTP_VIEW.values():
+        for view in self._required_camera_views:
             timestamp = timestamps.get(view)
             if timestamp is None:
                 errors.append(f"video:{view} missing")
@@ -283,6 +253,17 @@ class TeleavatarV2EEInterface(Node):
             elif now - pose_timestamp > self.sensor_timeout:
                 errors.append(f"pose:{topic} stale ({now - pose_timestamp:.2f}s)")
         return errors
+
+    def set_required_cameras(self, cameras: list[str] | tuple[str, ...] | None) -> None:
+        """Select RTP views from the policy server's training metadata."""
+        if cameras is None:
+            cameras = list(_POLICY_TO_RTP_VIEW)
+        unknown = set(cameras) - set(_POLICY_TO_RTP_VIEW)
+        if unknown:
+            raise ValueError(f"Policy metadata lists unknown cameras: {sorted(unknown)}")
+        if "left_color" not in cameras or "right_color" not in cameras:
+            raise ValueError("Policy metadata must require both wrist cameras")
+        self._required_camera_views = {_POLICY_TO_RTP_VIEW[name] for name in cameras}
 
     def ee_quaternion_target_errors(
         self,
@@ -364,13 +345,18 @@ class TeleavatarV2EEInterface(Node):
             # trigger is the inverse (0=open).
             state[_GRIPPER_STATE_INDEX[arm]] = 1.0 - gripper_triggers[arm]
 
-        return {
+        observation = {
             "observation/state": state,
             "observation/images/left_color": images[_POLICY_TO_RTP_VIEW["left_color"]],
             "observation/images/right_color": images[_POLICY_TO_RTP_VIEW["right_color"]],
-            "observation/images/head_camera": images[_POLICY_TO_RTP_VIEW["head_camera"]],
             "prompt": prompt,
         }
+        if "head_camera" in self._required_camera_names():
+            observation["observation/images/head_camera"] = images[_POLICY_TO_RTP_VIEW["head_camera"]]
+        return observation
+
+    def _required_camera_names(self) -> set[str]:
+        return {name for name, view in _POLICY_TO_RTP_VIEW.items() if view in self._required_camera_views}
 
     def publish_quaternion_action(self, action: np.ndarray) -> None:
         """Set one absolute bimanual ``left(8D) + right(8D)`` target.

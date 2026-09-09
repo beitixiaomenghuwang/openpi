@@ -10,6 +10,7 @@ The matching training configs are:
 - `pi05_teleavatar_v2_ee`
 - `pi05_teleavatar_v2_ee_rtc` (RTC `TRAINED` mode)
 - `pi0_teleavatar_v2_ee_low_mem_finetune`
+- `pi05_umi`, `pi05_umi_wrist_only`, and `pi05_umi_low_mem_finetune`
 
 Each checkpoint returns a synchronized 20D action chunk:
 `[left EE 10D, right EE 10D]`, where each arm is
@@ -130,17 +131,23 @@ python examples/teleavatar_v2_ee/main.py \
   --publish
 ```
 
-The model waypoints are stepped at 45 Hz by default. `main.py` converts each
-absolute rot6d waypoint to a quaternion once and submits it to the ROS2
+The model waypoints are stepped at `--control-frequency`. `main.py` converts
+each absolute rot6d waypoint to a quaternion once and submits it to the ROS2
 interface as the latest target. A separate timer publishes at 200 Hz by
-default. The timer owns a stateful SE(3) command trajectory: translation and
-rotation have independent speed, acceleration and jerk limits, while
-orientation follows the shortest rotation-vector log/exp path. This avoids
-restarting a zero-velocity ramp at every model tick and keeps the published
-commands continuous when the target stream moves. The first trajectory state
-starts from the measured EE poses. The first command publishes
-`/api/fsm/enable=1`, then the command callback repeats that heartbeat every
-four published frames (about 50 Hz at the default 200 Hz interpolation rate).
+default. The timer owns a command-side SE(3) interpolator: it traverses each
+target over exactly one control period, linearly in position and gripper
+trigger and along the shortest rotation-vector log/exp path in orientation, so
+the command reaches the model waypoint just as the next one arrives. A target
+that is replaced early or late resumes from the command actually published, so
+the stream stays continuous. The first interpolator state starts from the
+measured EE poses. The first command publishes `/api/fsm/enable=1`, then the
+command callback repeats that heartbeat every four published frames (about
+50 Hz at the default 200 Hz interpolation rate).
+
+The interpolator applies **no speed, acceleration or jerk limit**: a large model
+jump is passed to the controller at whatever rate it implies. The command-side
+guards are the `--max-position-error` / `--max-orientation-error` gate below and
+whatever limits the hardware controller enforces.
 
 ```bash
 # 45 Hz model targets -> 77 Hz interpolated command stream
@@ -154,20 +161,10 @@ python examples/teleavatar_v2_ee/main.py --remote-host <POLICY_SERVER_IP> \
   --control-frequency 45 --interp-frequency 200
 ```
 
-Use `--no-interpolate` for a zero-order-hold baseline at the selected target
-rate. `--control-frequency` sets how quickly model waypoints are consumed;
-`--interp-frequency` sets the timer publication rate. The trajectory limits
-are command-side limits; a value of `0` disables an individual limit. For
-example, the following keeps the default limits explicit:
-
-```bash
-python examples/teleavatar_v2_ee/main.py --remote-host <POLICY_SERVER_IP> \
-  --prompt "perform the manipulation task" --publish \
-  --control-frequency 45 --interp-frequency 200 \
-  --max-translation-speed 0.25 --max-rotation-speed 1.2 \
-  --max-translation-acceleration 1.0 --max-rotation-acceleration 4.0 \
-  --max-translation-jerk 10.0 --max-rotation-jerk 40.0
-```
+Use `--no-interpolate` for a zero-order-hold baseline that publishes the model
+waypoints directly at the target rate. `--control-frequency` sets how quickly
+model waypoints are consumed; `--interp-frequency` sets the timer publication
+rate.
 
 `--open-loop-horizon` controls how many model waypoints are used before
 observing and inferring again.
@@ -198,6 +195,12 @@ result back to absolute pose9 before sending it to this client. The client
 therefore must not compose either pose a second time. It converts each
 rotation-6D waypoint to a quaternion once, then the command-side trajectory
 publishes that quaternion directly in the ROS `Pose` message.
+
+UMI checkpoints use the same server-side conversion: their relative 20D output
+is anchored to the current UMI EE state and returned as absolute pose9
+waypoints, so this client can consume them with the same path. The server uses
+the checkpoint configuration's `use_head_camera` setting and advertises the
+required camera views in policy metadata; this client follows that metadata.
 
 The gripper API convention is `0=open, 1=closed`. Since this robot API does not
 provide gripper position feedback, the observation tracks the last command

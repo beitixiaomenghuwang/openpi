@@ -35,35 +35,18 @@ class Args:
     prompt: str = "perform the manipulation task"
     """Language instruction passed to the policy."""
 
-    control_frequency: float = 45.0
+    control_frequency: float = 30.0
     """Rate at which model waypoints are submitted as interpolation targets."""
 
     interp_frequency: float = 200.0
     """Rate at which interpolated Pose commands are published."""
 
     interpolate: bool = True
-    """Use the stateful EE trajectory generator for Pose commands."""
+    """Interpolate Pose commands up to `interp_frequency`.
 
-    max_translation_speed: float = 0.25
-    """Maximum command-side EE translation speed in m/s; 0 disables the limit."""
-
-    max_rotation_speed: float = 1.2
-    """Maximum command-side EE angular speed in rad/s; 0 disables the limit."""
-
-    max_translation_acceleration: float = 1.0
-    """Maximum command-side EE translation acceleration in m/s^2; 0 disables it."""
-
-    max_rotation_acceleration: float = 4.0
-    """Maximum command-side EE angular acceleration in rad/s^2; 0 disables it."""
-
-    max_translation_jerk: float = 10.0
-    """Maximum command-side EE translation jerk in m/s^3; 0 disables it."""
-
-    max_rotation_jerk: float = 40.0
-    """Maximum command-side EE angular jerk in rad/s^3; 0 disables it."""
-
-    max_trigger_speed: float = 5.0
-    """Maximum gripper trigger speed in normalized units/s; 0 disables it."""
+    `--no-interpolate` publishes the model waypoints directly at
+    `control_frequency` (zero-order hold).
+    """
 
     open_loop_horizon: int = 30
     """Actions executed from each model chunk when RTC is disabled."""
@@ -118,18 +101,6 @@ def _validate_args(args: Args) -> None:
         raise ValueError("interp_frequency must be positive")
     if args.open_loop_horizon <= 0:
         raise ValueError("open_loop_horizon must be positive")
-    for name in (
-        "max_translation_speed",
-        "max_rotation_speed",
-        "max_translation_acceleration",
-        "max_rotation_acceleration",
-        "max_translation_jerk",
-        "max_rotation_jerk",
-        "max_trigger_speed",
-    ):
-        value = float(getattr(args, name))
-        if value < 0.0 or not np.isfinite(value):
-            raise ValueError(f"{name} must be non-negative; use 0 to disable the limit")
     if args.rtc:
         if args.rtc_warmup_steps < 0:
             raise ValueError("rtc_warmup_steps cannot be negative")
@@ -242,6 +213,7 @@ def _run(args: Args, interface: TeleavatarV2EEInterface) -> None:
     metadata = client.get_server_metadata()
     logging.info("Connected to policy server; metadata=%s", metadata)
     _validate_server_metadata(metadata)
+    interface.set_required_cameras(metadata.get("cameras"))
 
     if args.publish:
         logging.info(
@@ -403,13 +375,6 @@ def main(args: Args) -> int:
             control_frequency=args.control_frequency,
             interp_frequency=args.interp_frequency,
             interpolate=args.interpolate,
-            max_translation_speed=args.max_translation_speed,
-            max_rotation_speed=args.max_rotation_speed,
-            max_translation_acceleration=args.max_translation_acceleration,
-            max_rotation_acceleration=args.max_rotation_acceleration,
-            max_translation_jerk=args.max_translation_jerk,
-            max_rotation_jerk=args.max_rotation_jerk,
-            max_trigger_speed=args.max_trigger_speed,
             initial_left_gripper_trigger=args.initial_left_gripper_trigger,
             initial_right_gripper_trigger=args.initial_right_gripper_trigger,
         )

@@ -68,6 +68,25 @@ def _relative_ee_actions(state: np.ndarray, actions: np.ndarray) -> np.ndarray:
     return np.concatenate(arm_actions, axis=-1)
 
 
+def _to_umi_state(state: np.ndarray) -> np.ndarray:
+    """Return the 16-D UMI EE state from native or TeleAvatar observations."""
+    state = np.asarray(state, dtype=np.float32)
+    if state.shape[-1] == UMI_RAW_DIM:
+        return state
+    # The TeleAvatar EE client publishes its converter-compatible 62-D state.
+    if state.shape[-1] >= 62:
+        return np.concatenate(
+            (
+                state[..., 48:55],
+                state[..., 7:8],
+                state[..., 55:62],
+                state[..., 15:16],
+            ),
+            axis=-1,
+        )
+    raise ValueError(f"Expected UMI state with 16 or TeleAvatar state with at least 62 dimensions, got {state.shape}")
+
+
 def _rotation_6d_to_matrix(rotation_6d: np.ndarray) -> np.ndarray:
     """Recover a row-major rotation matrix from the first two rows."""
     rotation_6d = np.asarray(rotation_6d, dtype=np.float32)
@@ -178,11 +197,16 @@ class UMIInputs(transforms.DataTransformFn):
             # Only pi0/pi0.5 mask padding images out of the attention; pi0-FAST does not.
             base_mask = np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_
 
+        # Keep the raw 16-D state as an auxiliary field for UMIOutputs.  pi0.5 ignores
+        # the regular state field, while the auxiliary value lets deployment compose
+        # relative model actions into absolute EE targets after sampling.
+        umi_state = _to_umi_state(data["observation/state"])
         inputs = {
             # pi0.5 has no continuous state input at all (see Pi0.embed_suffix), and the
             # actions are already expressed relative to the current pose, so the state is
             # only a placeholder for the shared Observation schema.
             "state": np.zeros(1, dtype=np.float32),
+            "umi_state": umi_state,
             "image": {
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": left_wrist,
@@ -195,7 +219,7 @@ class UMIInputs(transforms.DataTransformFn):
             },
         }
         if "action" in data:
-            inputs["actions"] = _relative_ee_actions(data["observation/state"], data["action"])
+            inputs["actions"] = _relative_ee_actions(umi_state, data["action"])
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
         return inputs
@@ -203,7 +227,25 @@ class UMIInputs(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class UMIOutputs(transforms.DataTransformFn):
-    """Return UMI's 20-D relative end-effector action representation."""
+    """Convert UMI's relative actions into absolute 20-D EE waypoints."""
 
     def __call__(self, data: dict) -> dict:
-        return {"actions": np.asarray(data["actions"][:, :UMI_ACTION_DIM])}
+        actions = np.asarray(data["actions"][..., :UMI_ACTION_DIM], dtype=np.float32)
+        state = data.get("umi_state")
+        if state is None:
+            raise ValueError("UMIOutputs requires the current 16-D state from UMIInputs")
+        single_action = actions.ndim == 1
+        if single_action:
+            actions = actions[None, ...]
+        absolute_quaternion = relative_actions_to_absolute(np.asarray(state), actions)
+        absolute = np.empty_like(actions)
+        for source_start, target_start in ((0, 0), (8, 10)):
+            absolute[:, target_start : target_start + 3] = absolute_quaternion[:, source_start : source_start + 3]
+            rotation = _quat_xyzw_to_rotation_matrix(
+                absolute_quaternion[:, source_start + 3 : source_start + 7]
+            )
+            absolute[:, target_start + 3 : target_start + 9] = rotation[:, :2, :].reshape(-1, 6)
+            absolute[:, target_start + 9] = np.clip(absolute_quaternion[:, source_start + 7], 0.0, 1.0)
+        if single_action:
+            absolute = absolute[0]
+        return {"actions": absolute}

@@ -1,9 +1,6 @@
 import numpy as np
 
-from examples.teleavatar_v2_ee.se3_trajectory import SE3Trajectory
-from examples.teleavatar_v2_ee.se3_trajectory import _quaternion_conjugate
-from examples.teleavatar_v2_ee.se3_trajectory import _quaternion_multiply
-from examples.teleavatar_v2_ee.se3_trajectory import _quaternion_to_rotvec
+from examples.teleavatar_v2_ee.se3_trajectory import SE3Interpolator
 
 
 def _quaternion_z(angle: float) -> np.ndarray:
@@ -29,18 +26,6 @@ def _action(position: float = 0.0, angle: float = 0.0) -> np.ndarray:
     )
 
 
-def _trajectory() -> SE3Trajectory:
-    return SE3Trajectory(
-        minimum_duration=1.0 / 45.0,
-        max_translation_speed=0.25,
-        max_rotation_speed=1.2,
-        max_translation_acceleration=1.0,
-        max_rotation_acceleration=4.0,
-        max_translation_jerk=10.0,
-        max_rotation_jerk=40.0,
-    )
-
-
 def test_shortest_path_is_sign_invariant() -> None:
     start = _action()
     target = _action(0.02, np.deg2rad(170.0))
@@ -48,47 +33,71 @@ def test_shortest_path_is_sign_invariant() -> None:
     signed_target[3:7] *= -1.0
     signed_target[11:15] *= -1.0
 
-    positive_trajectory = _trajectory()
-    positive_trajectory.reset(start)
-    positive_trajectory.set_target(target)
-    positive_output = positive_trajectory.step(0.005)
+    positive_interpolator = SE3Interpolator(duration=1.0 / 45.0)
+    positive_interpolator.reset(start)
+    positive_interpolator.set_target(target)
+    positive_output = positive_interpolator.step(0.005)
 
-    signed_trajectory = _trajectory()
-    signed_trajectory.reset(start)
-    signed_trajectory.set_target(signed_target)
-    output = signed_trajectory.step(0.005)
+    signed_interpolator = SE3Interpolator(duration=1.0 / 45.0)
+    signed_interpolator.reset(start)
+    signed_interpolator.set_target(signed_target)
+    output = signed_interpolator.step(0.005)
 
     assert np.isclose(np.linalg.norm(output[3:7]), 1.0)
     assert np.isclose(np.linalg.norm(output[11:15]), 1.0)
     np.testing.assert_allclose(output, positive_output, atol=1e-12)
 
 
-def test_retargeted_stream_respects_se3_limits() -> None:
-    trajectory = _trajectory()
-    trajectory.reset(_action())
+def test_reaches_each_target_within_one_control_period() -> None:
+    """The interpolator upsamples the target stream without adding tracking lag."""
+    control_period = 1.0 / 45.0
+    interpolator = SE3Interpolator(duration=control_period)
+    interpolator.reset(_action())
+    target = _action(0.02, np.deg2rad(30.0))
+    interpolator.set_target(target)
+
+    outputs = [interpolator.step(0.005) for _ in range(9)]  # 45 ms > one 22.2 ms control period
+    np.testing.assert_allclose(outputs[-1][:3], target[:3], atol=1e-12)
+    np.testing.assert_allclose(outputs[-1][3:7], target[3:7], atol=1e-12)
+    # The traversal is exactly linear in elapsed time, so 10 ms into a 22.2 ms
+    # period the command sits at 45% of the way, not behind it.
+    assert np.isclose(outputs[1][0] / target[0], 0.010 / control_period, rtol=1e-9)
+    for output in outputs:
+        assert np.isclose(np.linalg.norm(output[3:7]), 1.0)
+
+
+def test_command_stream_is_not_rate_limited() -> None:
+    """A large model jump is passed through, not clipped to a speed bound."""
+    control_period = 1.0 / 45.0
+    interpolator = SE3Interpolator(duration=control_period)
+    interpolator.reset(_action())
+    interpolator.set_target(_action(0.10))  # 10 cm in one control period == 4.5 m/s
+
+    outputs = [interpolator.step(0.005) for _ in range(5)]  # 25 ms, about one control period
+    speeds = np.linalg.norm(np.diff(np.asarray(outputs)[:, :3], axis=0), axis=1) / 0.005
+    # The command moves at exactly the rate the target implies, with no clipping.
+    # (The final tick is slower only because the traversal completes inside it.)
+    assert np.isclose(speeds.max(), 0.10 / control_period)
+
+
+def test_retarget_resumes_from_the_published_command() -> None:
+    """Replacing the target mid-traversal must not teleport the stream."""
+    interpolator = SE3Interpolator(duration=1.0 / 45.0)
+    interpolator.reset(_action())
     outputs = []
-    for tick in range(1000):
-        trajectory.set_target(_action(0.15, 1.0) if tick < 50 else _action(-0.1, -1.0))
-        outputs.append(trajectory.step(0.005))
+    for tick in range(200):
+        if tick % 4 == 0:  # a new target every 4 ticks, as at 45 Hz targets / 200 Hz publishing
+            interpolator.set_target(_action(0.15, 1.0) if tick < 52 else _action(-0.1, -1.0))
+        outputs.append(interpolator.step(0.005))
     outputs = np.asarray(outputs)
 
-    dt = 0.005
-    translation_velocity = np.diff(outputs[:, :3], axis=0) / dt
-    translation_acceleration = np.diff(translation_velocity, axis=0) / dt
-    translation_jerk = np.diff(translation_acceleration, axis=0) / dt
-    assert np.linalg.norm(translation_velocity, axis=1).max() <= 0.25 + 1e-6
-    assert np.linalg.norm(translation_acceleration, axis=1).max() <= 1.0 + 1e-6
-    assert np.linalg.norm(translation_jerk, axis=1).max() <= 10.0 + 1e-6
-
-    angular_velocity = []
-    for first, second in zip(outputs[:-1, 3:7], outputs[1:, 3:7]):
-        angular_velocity.append(_quaternion_to_rotvec(_quaternion_multiply(second, _quaternion_conjugate(first))) / dt)
-    angular_velocity = np.asarray(angular_velocity)
-    angular_acceleration = np.diff(angular_velocity, axis=0) / dt
-    angular_jerk = np.diff(angular_acceleration, axis=0) / dt
-    assert np.linalg.norm(angular_velocity, axis=1).max() <= 1.2 + 1e-6
-    assert np.linalg.norm(angular_acceleration, axis=1).max() <= 4.0 + 1e-6
-    assert np.linalg.norm(angular_jerk, axis=1).max() <= 40.0 + 1e-6
-
-    np.testing.assert_allclose(outputs[-1][:3], (-0.1, 0.0, 0.0), atol=1e-5)
-    np.testing.assert_allclose(outputs[-1][3:7], _quaternion_z(-1.0), atol=1e-5)
+    # Tick 52 reverses the target by 0.25 m. The command continues from the one
+    # just published, covering exactly dt/duration of the new gap rather than
+    # jumping to the new target.
+    before, after = outputs[51][0], outputs[52][0]
+    alpha = 0.005 / (1.0 / 45.0)
+    assert np.isclose(after, before + alpha * (-0.1 - before), rtol=1e-9)
+    np.testing.assert_allclose(outputs[-1][:3], (-0.1, 0.0, 0.0), atol=1e-6)
+    np.testing.assert_allclose(outputs[-1][3:7], _quaternion_z(-1.0), atol=1e-6)
+    for output in outputs:
+        assert np.isclose(np.linalg.norm(output[3:7]), 1.0)

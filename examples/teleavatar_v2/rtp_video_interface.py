@@ -10,6 +10,7 @@ Test-only file writing lives in test.py.
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import threading
 import time
@@ -31,6 +32,23 @@ except ImportError as exc:
     ) from exc
 
 
+def _pin_libgcc_unwinder() -> None:
+    """Keep libgcc's unwinder ahead of the one GStreamer drags in.
+
+    Gst.init() scans the plugin registry, which loads LLVM's libunwind.so.8 into
+    the global symbol scope; its _Unwind_Resume then shadows libgcc's. FastDDS
+    throws while opening its shared-memory transport, and unwinding with a
+    libunwind resume plus a libgcc personality routine segfaults inside
+    rcl_node_init -- so creating any rclpy Node after Gst.init() kills the
+    process. Loading libgcc_s globally first keeps that pairing consistent.
+    """
+    try:
+        ctypes.CDLL("libgcc_s.so.1", mode=ctypes.RTLD_GLOBAL)
+    except OSError:
+        pass
+
+
+_pin_libgcc_unwinder()
 Gst.init(None)
 
 
