@@ -53,6 +53,42 @@ class RsqrtDecaySchedule(LRScheduleConfig):
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class WarmupStableDecaySchedule(LRScheduleConfig):
+    """Linear warmup, constant peak until `decay_start`, then cosine decay to `decay_lr` over `decay_steps`.
+
+    Checkpoints from the constant phase can be resumed with an earlier `decay_start` to finish early.
+    """
+
+    warmup_steps: int = 2_000
+    peak_lr: float = 5e-5
+    decay_start: int = 80_000
+    decay_steps: int = 20_000
+    decay_lr: float = 5e-6
+
+    def __post_init__(self) -> None:
+        if self.decay_start < self.warmup_steps:
+            raise ValueError("decay_start must not be before the end of the warmup.")
+
+    def create(self) -> optax.Schedule:
+        return optax.join_schedules(
+            [
+                optax.linear_schedule(
+                    init_value=self.peak_lr / (self.warmup_steps + 1),
+                    end_value=self.peak_lr,
+                    transition_steps=self.warmup_steps,
+                ),
+                optax.constant_schedule(self.peak_lr),
+                optax.cosine_decay_schedule(
+                    init_value=self.peak_lr,
+                    decay_steps=self.decay_steps,
+                    alpha=self.decay_lr / self.peak_lr,
+                ),
+            ],
+            [self.warmup_steps, self.decay_start],
+        )
+
+
 @runtime_checkable
 class OptimizerConfig(Protocol):
     def create(

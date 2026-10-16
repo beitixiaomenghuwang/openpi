@@ -16,10 +16,17 @@ import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.transforms as transforms
 
+NORM_STATS_KEYS = ("state", "actions")
+
 
 class RemoveStrings(transforms.DataTransformFn):
     def __call__(self, x: dict) -> dict:
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
+
+
+class KeepNormStatsKeys(transforms.DataTransformFn):
+    def __call__(self, x: dict) -> dict:
+        return {k: x[k] for k in NORM_STATS_KEYS}
 
 
 class SkipVideoDataset:
@@ -68,10 +75,10 @@ def _create_single_torch_dataset_skip_video(
     from lerobot.common.datasets import lerobot_dataset
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
+    dataset = _data_loader.FileListLeRobotDataset(
         repo_id,
         delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)]
+            key: [t / dataset_meta.fps for t in range(action_horizon + data_config.action_sequence_extra_steps)]
             for key in data_config.action_sequence_keys
         },
     )
@@ -120,8 +127,9 @@ def create_torch_dataloader(
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-            RemoveStrings(),
+            # Keep only what the stats need. Strings are not supported by JAX, and the main process reads
+            # each batch from a pipe at ~600 MB/s: with the (dummy) images, a batch of 1024 frames is ~700 MB.
+            KeepNormStatsKeys(),
         ],
     )
     if max_frames is not None and max_frames < len(dataset):
@@ -183,7 +191,7 @@ def main(config_name: str, max_frames: int | None = None, skip_video: bool = Tru
             skip_video=skip_video,
         )
 
-    keys = ["state", "actions"]
+    keys = list(NORM_STATS_KEYS)
     stats = {key: normalize.RunningStats() for key in keys}
 
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
