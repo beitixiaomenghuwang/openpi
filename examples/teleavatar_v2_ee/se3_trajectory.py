@@ -86,8 +86,7 @@ class SE3Interpolator:
     Position and trigger are linear, orientation is shortest-path slerp.
 
     The published stream is deliberately unbounded: a large model jump is passed
-    on at whatever rate it implies. Command-side safety is the caller's job (see
-    ``ee_quaternion_target_errors`` in the ROS interface).
+    on at whatever rate it implies. Command-side validation is the caller's job.
     """
 
     def __init__(self, *, duration: float) -> None:

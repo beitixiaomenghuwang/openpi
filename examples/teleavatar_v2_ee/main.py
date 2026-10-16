@@ -87,12 +87,6 @@ class Args:
     publish: bool = False
     """Actually publish /api commands. Without --publish, inference is read-only."""
 
-    max_position_error: float = 0.20
-    """Stop if a target is farther from measured EE position than this (m); 0 disables."""
-
-    max_orientation_error: float = 0.80
-    """Stop if target/current EE orientation differs by more than this (rad); 0 disables."""
-
 
 def _validate_args(args: Args) -> None:
     if args.control_frequency <= 0.0:
@@ -116,10 +110,6 @@ def _validate_args(args: Args) -> None:
             raise ValueError("rtc_max_wait_s must be positive")
     if args.max_steps < 0:
         raise ValueError("max_steps cannot be negative")
-    if args.max_position_error < 0.0:
-        raise ValueError("max_position_error cannot be negative")
-    if args.max_orientation_error < 0.0:
-        raise ValueError("max_orientation_error cannot be negative")
     for name in ("initial_left_gripper_trigger", "initial_right_gripper_trigger"):
         if not 0.0 <= getattr(args, name) <= 1.0:
             raise ValueError(f"{name} must be in [0, 1]")
@@ -188,21 +178,10 @@ def _validate_and_publish_action(
     *,
     playback_context: str,
 ) -> None:
-    """Recheck live inputs and enforce EE safety immediately before publishing."""
+    """Recheck live inputs immediately before publishing."""
     errors = interface.sensor_errors()
     if errors:
         raise RuntimeError(f"Inputs became unavailable during {playback_context}: " + "; ".join(errors))
-
-    target_errors = interface.ee_quaternion_target_errors(
-        action,
-        max_position_error=args.max_position_error,
-        max_orientation_error=args.max_orientation_error,
-    )
-    if target_errors:
-        message = "EE target safety limit exceeded: " + "; ".join(target_errors)
-        if args.publish:
-            raise RuntimeError(message)
-        logging.warning("Read-only safety warning: %s", message)
 
     if args.publish:
         interface.publish_quaternion_action(action)
@@ -352,11 +331,6 @@ def main(args: Args) -> int:
         args.publish,
     )
     logging.info(
-        "EE safety limits: position=%.3fm orientation=%.3frad (0 disables each check)",
-        args.max_position_error,
-        args.max_orientation_error,
-    )
-    logging.info(
         "Startup gripper triggers are left=%.3f right=%.3f (0=open, 1=closed); they must match the physical grippers",
         args.initial_left_gripper_trigger,
         args.initial_right_gripper_trigger,
@@ -364,7 +338,7 @@ def main(args: Args) -> int:
 
     rclpy.init()
     interface: TeleavatarV2EEInterface | None = None
-    executor = rclpy.executors.MultiThreadedExecutor(num_threads=2)
+    executor = rclpy.executors.MultiThreadedExecutor()
     spin_thread: threading.Thread | None = None
     try:
         interface = TeleavatarV2EEInterface(

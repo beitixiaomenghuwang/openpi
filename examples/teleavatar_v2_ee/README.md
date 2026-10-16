@@ -145,9 +145,8 @@ command callback repeats that heartbeat every four published frames (about
 50 Hz at the default 200 Hz interpolation rate).
 
 The interpolator applies **no speed, acceleration or jerk limit**: a large model
-jump is passed to the controller at whatever rate it implies. The command-side
-guards are the `--max-position-error` / `--max-orientation-error` gate below and
-whatever limits the hardware controller enforces.
+jump is passed to the controller at whatever rate it implies. Any additional
+limits are enforced by the hardware controller.
 
 ```bash
 # 45 Hz model targets -> 77 Hz interpolated command stream
@@ -171,12 +170,6 @@ observing and inferring again.
 When `--rtc` is enabled, `--open-loop-horizon` is ignored because
 `RTCActionBroker` returns one action per control tick and handles chunk overlap
 on the server.
-
-Before accepting every model target, the client compares its EE pose with the
-latest measured current pose. It stops and disables output if the default
-position/orientation limits (0.20 m / 0.80 rad) are exceeded. Adjust them with
-`--max-position-error` and `--max-orientation-error`; use `0` to disable an
-individual check.
 
 ## Observation and Command Semantics
 
