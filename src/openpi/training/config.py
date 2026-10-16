@@ -24,11 +24,13 @@ import openpi.policies.teleavatar_v1_policy as teleavatar_v1_policy
 import openpi.policies.teleavatar_v2_ee_policy as teleavatar_v2_ee_policy
 import openpi.policies.teleavatar_v2_policy as teleavatar_v2_policy
 import openpi.policies.umi_policy as umi_policy
+import openpi.policies.yubi_umi_policy as yubi_umi_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
+import openpi.training.sampling as _sampling
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 
@@ -89,9 +91,16 @@ class DataConfig:
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
+    # Extra future frames loaded for every action sequence key beyond `action_horizon`. Lets a data transform
+    # anchor on the current frame and build targets for t+1..t+action_horizon (see yubi_umi_policy).
+    action_sequence_extra_steps: int = 0
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # If set, training draws frames with this sampler instead of shuffling uniformly. Only supported for a
+    # single LeRobot repo id; norm stats are still computed on uniformly sampled frames.
+    sampler: _sampling.TaskBalancedSampler | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -617,6 +626,50 @@ class LeRobotUMIDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotYubiUMIDataConfig(DataConfigFactory):
+    """Config for the YUBI UMI Arena dataset (airoa-org/yubi-corl2026-umi-arena).
+
+    Expects the official LeRobot v3.0 -> v2.1 conversion, which keeps the native feature names;
+    they are also the observation keys the UMI Arena harness sends, so the repack is an identity
+    selection. ``YubiUMIInputs`` builds the 11-D state (inter-hand pose with rotation-6D + gripper
+    angles) and, for training, 20-D action waypoints relative to the current hand_root pose. The
+    absolute hand poses are loaded for t..t+H so frame t can anchor the chunk; they are labels only
+    and are absent at evaluation. ``YubiUMIOutputs`` returns the 16-D UMI Arena publish vector.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        keys = (
+            yubi_umi_policy.LEFT_IMAGE,
+            yubi_umi_policy.RIGHT_IMAGE,
+            yubi_umi_policy.INTER_HAND_POSE,
+            yubi_umi_policy.JOINT_STATES,
+            *yubi_umi_policy.ACTION_SEQUENCE_KEYS,
+        )
+        repack_structure = {key: key for key in keys}
+        # Same as LeRobotUMIDataConfig: list the injected prompt only when it is present.
+        base_cfg = self.base_config or DataConfig()
+        if base_cfg.prompt_from_task:
+            repack_structure["prompt"] = "prompt"
+
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)])
+        data_transforms = _transforms.Group(
+            inputs=[yubi_umi_policy.YubiUMIInputs(action_horizon=model_config.action_horizon)],
+            outputs=[yubi_umi_policy.YubiUMIOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=yubi_umi_policy.ACTION_SEQUENCE_KEYS,
+            action_sequence_extra_steps=yubi_umi_policy.ACTION_SEQUENCE_EXTRA_STEPS,
         )
 
 
@@ -1281,7 +1334,7 @@ _CONFIGS = [
             action_dim=32,
         ),
         data=LeRobotTeleavatarV2EEDataConfig(
-            repo_id="path-to-dataset",
+            repo_id="gift_box_2_lerobot_45fps",
             base_config=DataConfig(
                 prompt_from_task=True,
                 action_sequence_keys=("action",),
@@ -1518,6 +1571,75 @@ _CONFIGS = [
             "action_space": "bimanual_end_effector",
             "action_dim": umi_policy.UMI_ACTION_DIM,
             "cameras": ["head_camera", "left_color", "right_color"],
+        },
+    ),
+    #
+    # YUBI UMI Arena (CoRL 2026) config.
+    #
+    # Trains on the PA (primitive action) episodes with the PA instruction as the prompt, which is
+    # what the evaluator sends for each subtask. Full fine-tuning at batch 1024 (128 per GPU on 8x B300)
+    # for 60K steps: 61.4M samples, ~1.04 passes over the 59M frames, about the one pass openpi's full
+    # DROID fine-tune makes (100K steps at batch 256). The peak LR is the batch-256 default 5e-5 scaled
+    # by sqrt(1024 / 256), the square-root rule for Adam.
+    # The model state goes in as discrete tokens (pi0.5 default), and the 32-step chunks at 30 Hz
+    # come out as the (32, 16) UMI Arena publish vector.
+    #
+    # Sampling is task-balanced (see openpi.training.sampling): SHT share ~ hours^0.5, the four SHTs
+    # behind the open tasks with data x2 (25% at most together), prompts within an SHT ~ episodes^0.5,
+    # and nothing above 5x its natural share. For validation, 1% of the recordings of every SHT and
+    # two whole SHTs (stand-ins for the hidden tasks) are held out; clear both for the final run.
+    #
+    TrainConfig(
+        name="pi05_yubi_umi",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            action_dim=32,
+        ),
+        data=LeRobotYubiUMIDataConfig(
+            # Cleaned v3.0 -> v2.1 conversion of airoa-org/yubi-corl2026-umi-arena (examples/yubi_umi).
+            repo_id="/mnt/dex/b300/home/guoxueyang/yubi-corl2026-umi-arena-v21",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                sampler=_sampling.TaskBalancedSampler(
+                    temperature=0.5,
+                    max_upsample=5.0,
+                    boosted_groups=(
+                        "Put the cup on the plate",
+                        "Place the cup on the plate, then put it back to its original position",
+                        "Pack Smartphone into Box",
+                        "Set Parts Supply (chain)",
+                    ),
+                    boost=2.0,
+                    max_boosted_share=0.25,
+                    holdout_groups=(
+                        "Dock a Robot Vacuum into the Station",
+                        "Fold t-shirt and put it on another t-shirt",
+                    ),
+                    holdout_recording_fraction=0.01,
+                ),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=1024,
+        num_train_steps=60_000,
+        lr_schedule=_optimizer.WarmupStableDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_start=48_000,
+            decay_steps=12_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_workers=128,
+        save_interval=2_500,
+        keep_period=5_000,
+        policy_metadata={
+            "robot_type": "yubi",
+            "action_space": "bimanual_end_effector_step_delta",
+            "action_dim": yubi_umi_policy.YUBI_PUBLISH_DIM,
+            "cameras": ["left", "right"],
         },
     ),
     TrainConfig(
