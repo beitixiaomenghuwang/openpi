@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import pathlib
 import sys
@@ -20,8 +21,10 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from examples.teleavatar_v2_ee.ros2_interface import _POLICY_TO_RTP_VIEW  # noqa: E402
 from examples.teleavatar_v2_ee.ros2_interface import TeleavatarV2EEInterface  # noqa: E402
 from examples.teleavatar_v2_ee.ros2_interface import _rot6d_to_quaternion  # noqa: E402
+from examples.teleavatar_v2_ee.se3_trajectory import blend_chunk_start  # noqa: E402
 
 
 @dataclasses.dataclass
@@ -35,8 +38,8 @@ class Args:
     prompt: str = "perform the manipulation task"
     """Language instruction passed to the policy."""
 
-    control_frequency: float = 30.0
-    """Rate at which model waypoints are submitted as interpolation targets."""
+    control_frequency: float = 45.0
+    """Rate at which model waypoints are submitted; must match the training data cadence (45 fps)."""
 
     interp_frequency: float = 200.0
     """Rate at which interpolated Pose commands are published."""
@@ -87,10 +90,20 @@ class Args:
     publish: bool = False
     """Actually publish /api commands. Without --publish, inference is read-only."""
 
+    chunk_blend_steps: int = 10
+    """Without RTC: start each chunk at the previous last target and fade that offset out over
+    this many targets. New chunks are anchored on the lagging measured pose; 0 disables."""
+
+    rtc_blend_steps: int = 5
+    """With RTC: cross-fade old/new chunk actions for this many steps after a switch; 0 disables."""
+
 
 def _validate_args(args: Args) -> None:
     if args.control_frequency <= 0.0:
         raise ValueError("control_frequency must be positive")
+    for name in ("chunk_blend_steps", "rtc_blend_steps"):
+        if getattr(args, name) < 0:
+            raise ValueError(f"{name} cannot be negative")
     if args.interp_frequency <= 0.0:
         raise ValueError("interp_frequency must be positive")
     if args.open_loop_horizon <= 0:
@@ -126,6 +139,11 @@ def _validate_server_metadata(metadata: dict) -> None:
             logging.warning("Policy metadata has no %r field; cannot verify %s", key, expected_value)
         elif actual != expected_value:
             raise RuntimeError(f"Policy/client mismatch: metadata[{key!r}]={actual!r}, expected {expected_value!r}")
+    cameras = metadata.get("cameras")
+    if cameras is not None:
+        unknown = set(cameras) - _POLICY_TO_RTP_VIEW.keys()
+        if unknown:
+            raise RuntimeError(f"Policy metadata lists cameras this client does not provide: {sorted(unknown)}")
 
 
 def _extract_action_chunk(result: dict, horizon: int) -> np.ndarray:
@@ -171,6 +189,12 @@ def _to_quaternion_action(action: np.ndarray) -> np.ndarray:
     return _to_quaternion_action_chunk(values[None, ...])[0]
 
 
+def _next_target_at(tick_started: float, period: float) -> float:
+    """Include the tick's own work in the period; after an overrun, rebase without a catch-up burst."""
+    now = time.monotonic()
+    return tick_started + period if now - tick_started < period else now + period
+
+
 def _validate_and_publish_action(
     args: Args,
     interface: TeleavatarV2EEInterface,
@@ -192,7 +216,6 @@ def _run(args: Args, interface: TeleavatarV2EEInterface) -> None:
     metadata = client.get_server_metadata()
     logging.info("Connected to policy server; metadata=%s", metadata)
     _validate_server_metadata(metadata)
-    interface.set_required_cameras(metadata.get("cameras"))
 
     if args.publish:
         logging.info(
@@ -208,6 +231,8 @@ def _run(args: Args, interface: TeleavatarV2EEInterface) -> None:
 
     period = 1.0 / args.control_frequency
     total_steps = 0
+    next_target_at = time.monotonic()
+    previous_last: np.ndarray | None = None
     while args.max_steps == 0 or total_steps < args.max_steps:
         observation = interface.get_policy_observation(args.prompt)
         inference_started = time.monotonic()
@@ -230,15 +255,15 @@ def _run(args: Args, interface: TeleavatarV2EEInterface) -> None:
             *actions[0, 8:11],
             actions[0, 15],
         )
+        if previous_last is not None:
+            actions = blend_chunk_start(previous_last, actions, args.chunk_blend_steps)
+        previous_last = actions[-1].copy()
 
-        next_target_at: float | None = None
         for action in actions:
-            if next_target_at is not None:
-                delay = next_target_at - time.monotonic()
-                if delay > 0.0:
-                    time.sleep(delay)
-                # Match the mature runtime's pacing: a late step starts from
-                # the current time instead of replaying missed deadlines.
+            delay = next_target_at - time.monotonic()
+            if delay > 0.0:
+                time.sleep(delay)
+            tick_started = time.monotonic()
 
             _validate_and_publish_action(
                 args,
@@ -247,10 +272,7 @@ def _run(args: Args, interface: TeleavatarV2EEInterface) -> None:
                 playback_context="action playback",
             )
             total_steps += 1
-            # Anchor the next period to this completed submission. A delayed
-            # step therefore slows the stream instead of releasing queued
-            # waypoints in a burst to catch up with an obsolete deadline.
-            next_target_at = time.monotonic() + period
+            next_target_at = _next_target_at(tick_started, period)
 
 
 def _run_rtc(
@@ -268,12 +290,17 @@ def _run_rtc(
             inference_delay=args.rtc_inference_delay,
             execution_horizon=args.rtc_execution_horizon,
             max_wait_s=args.rtc_max_wait_s,
+            blend_steps=args.rtc_blend_steps,
         ),
     )
 
     period = 1.0 / args.control_frequency
     total_steps = 0
     next_target_at: float | None = None
+    # The broker evaluates this only when it launches an inference request, on its
+    # worker thread; playback ticks no longer fetch and copy images.
+    observation = functools.partial(interface.get_policy_observation, args.prompt)
+    first_target_at: float | None = None
     logging.info(
         "RTC EE control loop enabled: one action per %.1f Hz tick; "
         "server must be started with --rtc.enabled (use GUIDED for validation, TRAINED after RTC fine-tuning)",
@@ -286,10 +313,9 @@ def _run_rtc(
                 if delay > 0.0:
                     time.sleep(delay)
 
-            observation = interface.get_policy_observation(args.prompt)
-            inference_started = time.monotonic()
+            tick_started = time.monotonic()
             result = broker.infer(observation)
-            inference_ms = (time.monotonic() - inference_started) * 1000.0
+            wait_ms = (time.monotonic() - tick_started) * 1000.0
             raw_action = np.asarray(result.get("actions"), dtype=np.float32)
             if raw_action.shape != (20,):
                 raise RuntimeError(f"RTC broker returned one action with shape (20,), got {raw_action.shape}")
@@ -302,16 +328,23 @@ def _run_rtc(
                 playback_context="RTC playback",
             )
             total_steps += 1
+            submitted_at = time.monotonic()
+            if first_target_at is None:
+                first_target_at = submitted_at
 
             if total_steps == 1 or total_steps % max(int(args.control_frequency), 1) == 0:
                 logging.info(
-                    "RTC action %d: infer %.1f ms, left xyz=(%.3f, %.3f, %.3f), right xyz=(%.3f, %.3f, %.3f)",
+                    "RTC action %d: infer %.1f ms (broker wait), target_hz=%.2f, "
+                    "left xyz=(%.3f, %.3f, %.3f), right xyz=(%.3f, %.3f, %.3f)",
                     total_steps,
-                    inference_ms,
+                    wait_ms,
+                    (total_steps - 1) / max(submitted_at - first_target_at, 1e-9),
                     *action[:3],
                     *action[8:11],
                 )
-            next_target_at = time.monotonic() + period
+            # Startup calibration and an empty RTC queue may block. Allow a
+            # full period after a blocked submission, without replaying a deficit.
+            next_target_at = _next_target_at(tick_started, period)
     finally:
         broker.reset()
 
@@ -338,7 +371,9 @@ def main(args: Args) -> int:
 
     rclpy.init()
     interface: TeleavatarV2EEInterface | None = None
-    executor = rclpy.executors.MultiThreadedExecutor()
+    # A worker pool adds scheduling/GIL contention on Humble. Inference uses a
+    # worker thread; RTP decoding and image preprocessing run in a separate process.
+    executor = rclpy.executors.SingleThreadedExecutor()
     spin_thread: threading.Thread | None = None
     try:
         interface = TeleavatarV2EEInterface(

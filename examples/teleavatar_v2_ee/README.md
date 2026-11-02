@@ -171,6 +171,34 @@ When `--rtc` is enabled, `--open-loop-horizon` is ignored because
 `RTCActionBroker` returns one action per control tick and handles chunk overlap
 on the server.
 
+`--control-frequency` defaults to 45 Hz, the cadence of the 45 fps training data.
+
+### Video process, pacing and logs (ported from the HIL branch)
+
+Video reception and decoding run in a spawned process (`policy_video.py`). The
+appsink callback only retains the newest owned RGB frame and its timestamp; eye
+selection and PIL letterboxed resizing to 224x224 run on demand, outside that
+callback, when an observation is requested. The output pixels match the
+server's own `ResizeImages` preprocessing. The client shares only three 224x224
+RGB inputs (451,584 bytes per observation), so the WebSocket request also shrinks.
+The per-packet Python RTP probe is disabled in this process.
+
+The ROS executor is single-threaded: a worker pool added scheduling/GIL
+contention on Humble. RTC builds observations on its inference worker only when
+requesting a new chunk; input freshness is still checked before every
+published target. The playback period includes processing time, and overruns
+rebase the next tick without a catch-up burst. RTC logs include `target_hz`; its
+`infer` value measures broker waiting, not GPU inference.
+
+Chunk transitions are blended, as in the SDK client: `--chunk-blend-steps`
+(default 10) starts a non-RTC chunk at the previous last target and fades the
+measured-pose anchoring offset out with a cosine weight (grippers unchanged);
+`--rtc-blend-steps` (default 5) cross-fades replaced and new RTC chunks for the
+same control steps.
+
+Update `packages/openpi-client` together with this example; the `ros2_rtc`
+environment already uses the editable checkout.
+
 ## Observation and Command Semantics
 
 The client sends the raw keys consumed by `TeleavatarEEInputs`:
@@ -191,9 +219,11 @@ publishes that quaternion directly in the ROS `Pose` message.
 
 UMI checkpoints use the same server-side conversion: their relative 20D output
 is anchored to the current UMI EE state and returned as absolute pose9
-waypoints, so this client can consume them with the same path. The server uses
-the checkpoint configuration's `use_head_camera` setting and advertises the
-required camera views in policy metadata; this client follows that metadata.
+waypoints, so this client can consume them with the same path. The client
+always sends all three views; a wrist-only UMI checkpoint
+(`use_head_camera=False`) ignores the head image. Policy metadata that lists
+a camera this client cannot provide is rejected before any command is
+published.
 
 The gripper API convention is `0=open, 1=closed`. Since this robot API does not
 provide gripper position feedback, the observation tracks the last command

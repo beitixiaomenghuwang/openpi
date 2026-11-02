@@ -3,7 +3,7 @@
 The policy emits absolute EE waypoints at a relatively low rate while the ROS
 interface publishes at a higher rate. ``SE3Interpolator`` is the command-side
 state between those two clocks: it traverses each target geometrically over one
-control period, with linear position/trigger and shortest-path slerp for
+control period, with linear position, optional trigger interpolation, and shortest-path slerp for
 orientation via quaternion exp/log maps. It has no velocity, acceleration or
 jerk state, so it adds no tracking lag and imposes no rate limits of its own.
 The implementation intentionally has no ROS dependencies so it can be tested
@@ -77,22 +77,56 @@ def _validate_bimanual_action(action: np.ndarray) -> np.ndarray:
     return value
 
 
+def blend_chunk_start(previous: np.ndarray, chunk: np.ndarray, steps: int) -> np.ndarray:
+    """Start a new bimanual chunk at ``previous`` and fade that offset out over ``steps`` targets.
+
+    A new chunk is anchored on the measured pose, which lags the previous chunk's last
+    target while the arm moves; without blending the command snaps back by that lag in one
+    control period. Each arm's position offset and rotation offset (left-multiplied, i.e.
+    in the shoulder frame) between ``previous`` and the chunk's first target are scaled by
+    a cosine fade from ~1 to 0, so the chunk is followed unchanged after ``steps`` targets.
+    Gripper triggers keep the chunk's values. ``steps <= 0`` returns an unchanged copy.
+    """
+    previous = _validate_bimanual_action(previous)
+    values = np.array(chunk, dtype=np.float64, copy=True)
+    if values.ndim != 2 or values.shape[1] != 16 or not np.all(np.isfinite(values)):
+        raise ValueError(f"Expected a finite (N, 16) quaternion chunk, got shape {values.shape}")
+    if steps <= 0 or len(values) == 0:
+        return values
+    for start in (0, 8):
+        position_offset = previous[start : start + 3] - values[0, start : start + 3]
+        rotation_offset = _quaternion_to_rotvec(
+            _quaternion_multiply(
+                previous[start + 3 : start + 7], _quaternion_conjugate(values[0, start + 3 : start + 7])
+            )
+        )
+        for index in range(min(steps, len(values))):
+            fade = 0.5 + 0.5 * float(np.cos(np.pi * (index + 1) / (steps + 1)))
+            values[index, start : start + 3] += fade * position_offset
+            values[index, start + 3 : start + 7] = _quaternion_multiply(
+                _rotvec_to_quaternion(fade * rotation_offset), values[index, start + 3 : start + 7]
+            )
+    return values
+
+
 class SE3Interpolator:
     """Stateful bimanual target generator for ``left(8D) + right(8D)`` actions.
 
     A target is held until the next model tick. Each target is traversed over
     exactly one ``duration`` (the control period), so the command reaches the
     model waypoint by the time the next one arrives and adds no tracking lag.
-    Position and trigger are linear, orientation is shortest-path slerp.
+    Position is linear, orientation is shortest-path slerp. Triggers are linear
+    by default; interpolate_gripper=False immediately uses each target trigger.
 
     The published stream is deliberately unbounded: a large model jump is passed
     on at whatever rate it implies. Command-side validation is the caller's job.
     """
 
-    def __init__(self, *, duration: float) -> None:
+    def __init__(self, *, duration: float, interpolate_gripper: bool = True) -> None:
         if float(duration) <= 0.0 or not np.isfinite(float(duration)):
             raise ValueError("Interpolation duration must be positive and finite")
         self.duration = float(duration)
+        self.interpolate_gripper = interpolate_gripper
         self._start: np.ndarray | None = None
         self._target: np.ndarray | None = None
         self._command: np.ndarray | None = None
@@ -157,8 +191,10 @@ class SE3Interpolator:
             command[start + 3 : start + 7] = _quaternion_multiply(
                 _rotvec_to_quaternion(alpha * rotation), start_quaternion
             )
-            command[start + 7] = np.clip(
-                (1.0 - alpha) * self._start[start + 7] + alpha * self._target[start + 7], 0.0, 1.0
+            command[start + 7] = (
+                np.clip((1.0 - alpha) * self._start[start + 7] + alpha * self._target[start + 7], 0.0, 1.0)
+                if self.interpolate_gripper
+                else self._target[start + 7]
             )
         self._command = command
         return command.copy()

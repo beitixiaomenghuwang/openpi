@@ -18,7 +18,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from examples.teleavatar_v2.rtp_video_interface import RTPH265VideoInterface  # noqa: E402
+from examples.teleavatar_v2_ee.policy_video import PolicyVideo  # noqa: E402
 from examples.teleavatar_v2_ee.se3_trajectory import SE3Interpolator  # noqa: E402
 
 _EE_STATE_OFFSET = {"left": 48, "right": 55}
@@ -128,8 +128,10 @@ class TeleavatarV2EEInterface(Node):
         control_frequency: float = 45.0,
         interp_frequency: float = 200.0,
         interpolate: bool = True,
+        interpolate_gripper: bool = True,
         initial_left_gripper_trigger: float = 0.0,
         initial_right_gripper_trigger: float = 0.0,
+        camera_views: dict[str, str] | None = None,
         node_name: str = "teleavatar_v2_ee_openpi_interface",
     ) -> None:
         super().__init__(node_name)
@@ -140,6 +142,7 @@ class TeleavatarV2EEInterface(Node):
         if interp_frequency <= 0.0:
             raise ValueError("interp_frequency must be positive")
         self.sensor_timeout = float(sensor_timeout)
+        self._camera_views = dict(_POLICY_TO_RTP_VIEW if camera_views is None else camera_views)
         self._lock = Lock()
         self._latest_poses: dict[str, Pose] = {}
         self._pose_timestamps: dict[str, float] = {}
@@ -153,25 +156,22 @@ class TeleavatarV2EEInterface(Node):
         self._interpolate = bool(interpolate)
         self._ctrl_period = 1.0 / float(control_frequency)
         self._interp_period = 1.0 / float(interp_frequency)
-        self._trajectory = SE3Interpolator(duration=self._ctrl_period)
+        self._trajectory = SE3Interpolator(duration=self._ctrl_period, interpolate_gripper=interpolate_gripper)
         self._trajectory_last_update: float | None = None
         self._last_cmd_action: np.ndarray | None = None
         self._have_target = False
         self._target_generation = 0
         self._enable_counter = 0
 
-        self._video = RTPH265VideoInterface(
+        # RTP reception/decoding and 224x224 model-input preparation run in a
+        # spawned process, so ROS callbacks and inference cannot starve udpsrc.
+        self._video = PolicyVideo(
             port=rtp_port,
             payload=rtp_payload,
             decoder=rtp_decoder,
+            views=tuple(self._camera_views.values()),
         )
         self._video.start()
-        # The policy server metadata selects whether the head view is needed.
-        # Wrist views are always required by the bimanual EE policies.
-        self._required_camera_views = {
-            _POLICY_TO_RTP_VIEW["left_color"],
-            _POLICY_TO_RTP_VIEW["right_color"],
-        }
 
         self._pose_topics = {arm: f"/{arm}_arm/current_ee_pose" for arm in ("left", "right")}
         self._pose_publishers = {
@@ -225,7 +225,7 @@ class TeleavatarV2EEInterface(Node):
             errors.append("RTP pipeline stopped")
 
         timestamps = self._video.get_image_timestamps()
-        for view in self._required_camera_views:
+        for view in self._camera_views.values():
             timestamp = timestamps.get(view)
             if timestamp is None:
                 errors.append(f"video:{view} missing")
@@ -241,17 +241,6 @@ class TeleavatarV2EEInterface(Node):
             elif now - pose_timestamp > self.sensor_timeout:
                 errors.append(f"pose:{topic} stale ({now - pose_timestamp:.2f}s)")
         return errors
-
-    def set_required_cameras(self, cameras: list[str] | tuple[str, ...] | None) -> None:
-        """Select RTP views from the policy server's training metadata."""
-        if cameras is None:
-            cameras = list(_POLICY_TO_RTP_VIEW)
-        unknown = set(cameras) - set(_POLICY_TO_RTP_VIEW)
-        if unknown:
-            raise ValueError(f"Policy metadata lists unknown cameras: {sorted(unknown)}")
-        if "left_color" not in cameras or "right_color" not in cameras:
-            raise ValueError("Policy metadata must require both wrist cameras")
-        self._required_camera_views = {_POLICY_TO_RTP_VIEW[name] for name in cameras}
 
     def wait_for_initial_data(self, timeout: float = 30.0) -> bool:
         deadline = time.monotonic() + timeout
@@ -288,18 +277,11 @@ class TeleavatarV2EEInterface(Node):
             # trigger is the inverse (0=open).
             state[_GRIPPER_STATE_INDEX[arm]] = 1.0 - gripper_triggers[arm]
 
-        observation = {
+        return {
             "observation/state": state,
-            "observation/images/left_color": images[_POLICY_TO_RTP_VIEW["left_color"]],
-            "observation/images/right_color": images[_POLICY_TO_RTP_VIEW["right_color"]],
+            **{f"observation/images/{name}": images[view] for name, view in self._camera_views.items()},
             "prompt": prompt,
         }
-        if "head_camera" in self._required_camera_names():
-            observation["observation/images/head_camera"] = images[_POLICY_TO_RTP_VIEW["head_camera"]]
-        return observation
-
-    def _required_camera_names(self) -> set[str]:
-        return {name for name, view in _POLICY_TO_RTP_VIEW.items() if view in self._required_camera_views}
 
     def publish_quaternion_action(self, action: np.ndarray) -> None:
         """Set one absolute bimanual ``left(8D) + right(8D)`` target.
